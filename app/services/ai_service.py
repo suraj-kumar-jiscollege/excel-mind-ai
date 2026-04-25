@@ -19,7 +19,10 @@ class AIService:
             try:
                 return await self._preview_with_gemini(command, snapshot)
             except Exception as e:
-                # Log the error if needed: print(f"Gemini error: {e}")
+                import sys
+                import traceback
+                print(f"Gemini API Error: {repr(e)}", file=sys.stderr)
+                traceback.print_exc(file=sys.stderr)
                 return self._preview_with_heuristics(command, snapshot)
         return self._preview_with_heuristics(command, snapshot)
 
