@@ -66,6 +66,32 @@ class WorkbookService:
         self._sessions[session_id] = session
         return self.get_snapshot(session_id)
 
+    def open_workbook_from_bytes(self, content: bytes, filename: str) -> WorkbookSnapshot:
+        import io
+        path = Path(filename)
+        if path.suffix.lower() != ".xlsx":
+            raise HTTPException(status_code=400, detail="Only .xlsx files are supported.")
+        
+        file_io = io.BytesIO(content)
+        workbook = load_workbook(file_io)
+        session_id = str(uuid4())
+        session = WorkbookSession(
+            session_id=session_id,
+            file_path=path,
+            workbook=workbook,
+            active_sheet=workbook.active.title,
+        )
+        self._sessions[session_id] = session
+        return self.get_snapshot(session_id)
+
+    def get_workbook_bytes(self, session_id: str) -> bytes:
+        session = self.get_session(session_id)
+        import io
+        out = io.BytesIO()
+        session.workbook.save(out)
+        session.dirty = False
+        return out.getvalue()
+
     def get_session(self, session_id: str) -> WorkbookSession:
         session = self._sessions.get(session_id)
         if not session:

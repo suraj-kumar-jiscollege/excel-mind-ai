@@ -2,9 +2,9 @@ from __future__ import annotations
 from dotenv import load_dotenv
 load_dotenv()
 
-from fastapi import FastAPI
+from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import RedirectResponse
+from fastapi.responses import RedirectResponse, Response
 
 from app.models import (
     CommandExecuteRequest,
@@ -13,7 +13,6 @@ from app.models import (
     SaveWorkbookRequest,
     SaveWorkbookResponse,
     UpdateCellRequest,
-    WorkbookOpenRequest,
     WorkbookSessionRequest,
     WorkbookSheetRequest,
     WorkbookSnapshot,
@@ -46,8 +45,19 @@ def health() -> dict[str, str]:
 
 
 @app.post("/api/workbooks/open", response_model=WorkbookSnapshot)
-def open_workbook(payload: WorkbookOpenRequest) -> WorkbookSnapshot:
-    return workbook_service.open_workbook(payload.file_path)
+async def open_workbook(file: UploadFile = File(...)) -> WorkbookSnapshot:
+    content = await file.read()
+    return workbook_service.open_workbook_from_bytes(content, file.filename or "workbook.xlsx")
+
+@app.get("/api/workbooks/{session_id}/download")
+def download_workbook(session_id: str):
+    session = workbook_service.get_session(session_id)
+    content = workbook_service.get_workbook_bytes(session_id)
+    return Response(
+        content=content,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{session.file_path.name}"'}
+    )
 
 
 @app.get("/api/workbooks/{session_id}", response_model=WorkbookSnapshot)
