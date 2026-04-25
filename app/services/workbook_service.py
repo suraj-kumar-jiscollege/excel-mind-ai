@@ -47,6 +47,14 @@ class WorkbookService:
     def __init__(self) -> None:
         self._sessions: dict[str, WorkbookSession] = {}
 
+    def detect_header_row(self, session_id: str, sheet_name: str) -> int:
+        worksheet = self._get_sheet(self.get_session(session_id), sheet_name)
+        return self._detect_header_row(worksheet)
+
+    def data_start_row(self, session_id: str, sheet_name: str) -> int:
+        worksheet = self._get_sheet(self.get_session(session_id), sheet_name)
+        return self._data_start_row(worksheet)
+
     def open_workbook(self, file_path: str) -> WorkbookSnapshot:
         path = Path(file_path).expanduser().resolve()
         self._validate_path(path)
@@ -249,7 +257,8 @@ class WorkbookService:
     def find_first_empty_cell(self, session_id: str, sheet_name: str, column_letter: str) -> str:
         worksheet = self._get_sheet(self.get_session(session_id), sheet_name)
         column_index = column_index_from_string(column_letter)
-        for row_idx in range(2, worksheet.max_row + 2):
+        start_row = self._data_start_row(worksheet)
+        for row_idx in range(start_row, worksheet.max_row + 2):
             cell = worksheet.cell(row=row_idx, column=column_index)
             if cell.value in (None, ""):
                 return cell.coordinate
@@ -268,7 +277,7 @@ class WorkbookService:
         indices = self._header_indices(worksheet, columns)
         seen = set()
         duplicates = 0
-        for row_idx in range(2, worksheet.max_row + 1):
+        for row_idx in range(self._data_start_row(worksheet), worksheet.max_row + 1):
             row = [worksheet.cell(row=row_idx, column=col_idx).value for col_idx in range(1, worksheet.max_column + 1)]
             key = tuple(row[index] for index in indices)
             if key in seen:
@@ -290,7 +299,7 @@ class WorkbookService:
         column_letter = self._resolve_column_letter(worksheet, target_column)
         columns = [column_index_from_string(column_letter)] if column_letter else list(range(1, worksheet.max_column + 1))
         hits = 0
-        for row_idx in range(1, worksheet.max_row + 1):
+        for row_idx in range(self._data_start_row(worksheet), worksheet.max_row + 1):
             for column_index in columns:
                 value = worksheet.cell(row=row_idx, column=column_index).value
                 if isinstance(value, str) and find_text in value:
@@ -304,7 +313,7 @@ class WorkbookService:
             return 0
         column_index = column_index_from_string(column_letter)
         hits = 0
-        for row_idx in range(2, worksheet.max_row + 1):
+        for row_idx in range(self._data_start_row(worksheet), worksheet.max_row + 1):
             value = worksheet.cell(row=row_idx, column=column_index).value
             number = self._coerce_number(value)
             if number is not None and number > threshold:
@@ -342,13 +351,13 @@ class WorkbookService:
         worksheet = self._get_sheet(self.get_session(session_id), sheet_name)
         column_letter = self._resolve_column_letter(worksheet, target_column)
         if not column_letter:
-            return 0, max(0, worksheet.max_row - 1)
+            return 0, max(0, worksheet.max_row - self._data_start_row(worksheet) + 1)
 
         column_index = column_index_from_string(column_letter)
         convertible = 0
         skipped = 0
         date_format = "DD-MMM-YYYY" if target_type == "date" else None
-        for row_idx in range(2, worksheet.max_row + 1):
+        for row_idx in range(self._data_start_row(worksheet), worksheet.max_row + 1):
             value = worksheet.cell(row=row_idx, column=column_index).value
             if value in (None, ""):
                 continue
@@ -363,8 +372,9 @@ class WorkbookService:
         if not header_name:
             return None
         target = self._normalize(header_name)
+        header_row = self._detect_header_row(worksheet)
         for idx in range(1, worksheet.max_column + 1):
-            value = worksheet.cell(row=1, column=idx).value
+            value = worksheet.cell(row=header_row, column=idx).value
             if self._normalize(str(value or "")) == target:
                 return get_column_letter(idx)
         return None
@@ -377,7 +387,9 @@ class WorkbookService:
     def _sheet_summary(self, worksheet: Worksheet) -> SheetSummary:
         max_row = worksheet.max_row or 1
         max_column = worksheet.max_column or 1
-        headers = [self._stringify(worksheet.cell(row=1, column=idx).value) for idx in range(1, max_column + 1)]
+        header_row = self._detect_header_row(worksheet)
+        data_start_row = min(header_row + 1, max_row + 1)
+        headers = [self._stringify(worksheet.cell(row=header_row, column=idx).value) for idx in range(1, max_column + 1)]
         rows: list[list[Any]] = []
         row_numbers: list[int] = []
         hidden_row_count = 0
@@ -392,12 +404,14 @@ class WorkbookService:
 
         preview_limit = 10_000
         for row_idx in range(1, max_row + 1):
-            if row_idx == 1:
+            if row_idx == header_row:
                 row_values = [
                     worksheet.cell(row=row_idx, column=col_idx).value for col_idx in range(1, max_column + 1)
                 ]
                 rows.append(row_values)
                 row_numbers.append(row_idx)
+                continue
+            if row_idx < data_start_row:
                 continue
             if worksheet.row_dimensions[row_idx].hidden:
                 hidden_row_count += 1
@@ -428,7 +442,9 @@ class WorkbookService:
     def _sheet_context(self, worksheet: Worksheet) -> SheetContext:
         max_row = worksheet.max_row or 1
         max_column = worksheet.max_column or 1
-        headers = [self._stringify(worksheet.cell(row=1, column=idx).value) for idx in range(1, max_column + 1)]
+        header_row = self._detect_header_row(worksheet)
+        data_start_row = min(header_row + 1, max_row + 1)
+        headers = [self._stringify(worksheet.cell(row=header_row, column=idx).value) for idx in range(1, max_column + 1)]
         data_types: dict[str, str] = {}
         numeric_headers: list[str] = []
         text_headers: list[str] = []
@@ -438,7 +454,7 @@ class WorkbookService:
         for col_idx in range(1, max_column + 1):
             header = headers[col_idx - 1] or get_column_letter(col_idx)
             values = []
-            for row_idx in range(2, max_row + 1):
+            for row_idx in range(data_start_row, max_row + 1):
                 value = worksheet.cell(row=row_idx, column=col_idx).value
                 if value is not None:
                     values.append(value)
@@ -453,7 +469,7 @@ class WorkbookService:
             else:
                 text_headers.append(header)
 
-        for row_idx in range(2, max_row + 1):
+        for row_idx in range(data_start_row, max_row + 1):
             if worksheet.row_dimensions[row_idx].hidden:
                 continue
             row_data: dict[str, Any] = {}
@@ -492,7 +508,7 @@ class WorkbookService:
 
         return WorkbookStats(
             sheet_count=len(sheets),
-            total_rows=sum(max(0, sheet.max_row - 1) for sheet in sheets),
+            total_rows=sum(max(0, sheet.max_row - self._detect_header_row(workbook[sheet.name])) for sheet in sheets),
             total_columns=sum(sheet.max_column for sheet in sheets),
             total_formula_cells=sum(sheet.formula_cell_count for sheet in sheets),
             total_hidden_rows=sum(sheet.hidden_row_count for sheet in sheets),
@@ -591,7 +607,12 @@ class WorkbookService:
         if not target_column or source_value in (None, ""):
             raise HTTPException(status_code=400, detail="Fill formula requires a target column and a formula template.")
 
-        start_row = int(plan.parameters.get("start_row", 2))
+        header_row = int(plan.parameters.get("header_row", max(1, self._detect_header_row(worksheet))))
+        column_header = plan.parameters.get("column_header")
+        if column_header:
+            worksheet[f"{target_column}{header_row}"] = column_header
+
+        start_row = int(plan.parameters.get("start_row", header_row + 1))
         end_row = int(plan.parameters.get("end_row", worksheet.max_row))
         for row_idx in range(start_row, end_row + 1):
             target_cell = f"{target_column}{row_idx}"
@@ -612,8 +633,9 @@ class WorkbookService:
 
         sort_index = column_index_from_string(target_column) - 1
         descending = bool(plan.parameters.get("descending", False))
+        data_start_row = self._data_start_row(worksheet)
         data_rows = []
-        for row_idx in range(2, worksheet.max_row + 1):
+        for row_idx in range(data_start_row, worksheet.max_row + 1):
             values = [worksheet.cell(row=row_idx, column=col_idx).value for col_idx in range(1, worksheet.max_column + 1)]
             data_rows.append(values)
 
@@ -631,7 +653,8 @@ class WorkbookService:
         indices = self._header_indices(worksheet, plan.parameters.get("columns") or ([plan.target_column] if plan.target_column else []))
         seen = set()
         unique_rows: list[list[Any]] = []
-        for row_idx in range(2, worksheet.max_row + 1):
+        data_start_row = self._data_start_row(worksheet)
+        for row_idx in range(data_start_row, worksheet.max_row + 1):
             row = [worksheet.cell(row=row_idx, column=col_idx).value for col_idx in range(1, worksheet.max_column + 1)]
             key = tuple(row[index] for index in indices)
             if key in seen:
@@ -640,12 +663,12 @@ class WorkbookService:
             unique_rows.append(row)
 
         original_max_row = worksheet.max_row
-        for row_idx in range(2, original_max_row + 1):
+        for row_idx in range(data_start_row, original_max_row + 1):
             worksheet.row_dimensions[row_idx].hidden = False
             for col_idx in range(1, worksheet.max_column + 1):
                 worksheet.cell(row=row_idx, column=col_idx).value = None
 
-        for row_offset, row_values in enumerate(unique_rows, start=2):
+        for row_offset, row_values in enumerate(unique_rows, start=data_start_row):
             for col_idx, value in enumerate(row_values, start=1):
                 worksheet.cell(row=row_offset, column=col_idx).value = value
 
@@ -657,7 +680,7 @@ class WorkbookService:
 
         column_letter = self._resolve_column_letter(worksheet, plan.target_column)
         columns = [column_index_from_string(column_letter)] if column_letter else list(range(1, worksheet.max_column + 1))
-        for row_idx in range(1, worksheet.max_row + 1):
+        for row_idx in range(self._data_start_row(worksheet), worksheet.max_row + 1):
             for column_index in columns:
                 cell = worksheet.cell(row=row_idx, column=column_index)
                 if isinstance(cell.value, str) and find_text in cell.value:
@@ -671,7 +694,7 @@ class WorkbookService:
             raise HTTPException(status_code=400, detail="Highlight action needs a target column and threshold.")
 
         fill = PatternFill(start_color=color, end_color=color, fill_type="solid")
-        cell_range = f"{target_column}2:{target_column}{worksheet.max_row}"
+        cell_range = f"{target_column}{self._data_start_row(worksheet)}:{target_column}{worksheet.max_row}"
         worksheet.conditional_formatting.add(
             cell_range,
             CellIsRule(operator="greaterThan", formula=[str(threshold)], fill=fill),
@@ -685,14 +708,15 @@ class WorkbookService:
             raise HTTPException(status_code=400, detail="Filter action needs a target column.")
 
         column_index = column_index_from_string(target_column)
-        worksheet.auto_filter.ref = f"A1:{get_column_letter(worksheet.max_column)}{worksheet.max_row}"
-        for row_idx in range(2, worksheet.max_row + 1):
+        header_row = self._detect_header_row(worksheet)
+        worksheet.auto_filter.ref = f"A{header_row}:{get_column_letter(worksheet.max_column)}{worksheet.max_row}"
+        for row_idx in range(self._data_start_row(worksheet), worksheet.max_row + 1):
             value = worksheet.cell(row=row_idx, column=column_index).value
             worksheet.row_dimensions[row_idx].hidden = not self._matches_condition(value, operator, criterion)
 
     def _clear_filter(self, worksheet: Worksheet) -> None:
         worksheet.auto_filter.ref = ""
-        for row_idx in range(2, worksheet.max_row + 1):
+        for row_idx in range(self._data_start_row(worksheet), worksheet.max_row + 1):
             worksheet.row_dimensions[row_idx].hidden = False
 
     def _create_chart(self, session: WorkbookSession, worksheet: Worksheet, plan: ActionPlan) -> None:
@@ -720,13 +744,13 @@ class WorkbookService:
         data = Reference(
             worksheet,
             min_col=column_index_from_string(value_column),
-            min_row=1,
+            min_row=self._detect_header_row(worksheet),
             max_row=max(2, worksheet.max_row),
         )
         categories = Reference(
             worksheet,
             min_col=column_index_from_string(category_column),
-            min_row=2,
+            min_row=self._data_start_row(worksheet),
             max_row=max(2, worksheet.max_row),
         )
         chart.add_data(data, titles_from_data=True)
@@ -744,7 +768,7 @@ class WorkbookService:
             raise HTTPException(status_code=400, detail="Column conversion needs a valid target column and target type.")
 
         column_index = column_index_from_string(target_column)
-        for row_idx in range(2, worksheet.max_row + 1):
+        for row_idx in range(self._data_start_row(worksheet), worksheet.max_row + 1):
             cell = worksheet.cell(row=row_idx, column=column_index)
             if cell.value in (None, ""):
                 continue
@@ -769,7 +793,7 @@ class WorkbookService:
         val_idx = column_index_from_string(val_letter)
 
         summary = {}
-        for row_idx in range(2, worksheet.max_row + 1):
+        for row_idx in range(self._data_start_row(worksheet), worksheet.max_row + 1):
             if worksheet.row_dimensions[row_idx].hidden:
                 continue
             group_val = worksheet.cell(row=row_idx, column=group_idx).value
@@ -814,7 +838,8 @@ class WorkbookService:
 
         secondary_map = {}
         sec_max_col = secondary_sheet.max_column
-        for row_idx in range(2, secondary_sheet.max_row + 1):
+        sec_data_start = self._data_start_row(secondary_sheet)
+        for row_idx in range(sec_data_start, secondary_sheet.max_row + 1):
             key_val = secondary_sheet.cell(row=row_idx, column=secondary_col_idx).value
             if key_val is None:
                 continue
@@ -826,11 +851,14 @@ class WorkbookService:
         current_new_col = start_new_col
         for c in range(1, sec_max_col + 1):
             if c != secondary_col_idx:
-                header_val = secondary_sheet.cell(row=1, column=c).value
-                primary_sheet.cell(row=1, column=current_new_col).value = f"{secondary_sheet_name}_{header_val}"
+                header_val = secondary_sheet.cell(row=self._detect_header_row(secondary_sheet), column=c).value
+                primary_sheet.cell(row=self._detect_header_row(primary_sheet), column=current_new_col).value = (
+                    f"{secondary_sheet_name}_{header_val}"
+                )
                 current_new_col += 1
 
-        for row_idx in range(2, primary_sheet.max_row + 1):
+        primary_data_start = self._data_start_row(primary_sheet)
+        for row_idx in range(primary_data_start, primary_sheet.max_row + 1):
             key_val = primary_sheet.cell(row=row_idx, column=primary_col_idx).value
             if key_val is None:
                 continue
@@ -891,6 +919,58 @@ class WorkbookService:
             if column_letter:
                 indices.append(column_index_from_string(column_letter) - 1)
         return indices or list(range(worksheet.max_column))
+
+    def _detect_header_row(self, worksheet: Worksheet) -> int:
+        max_scan_row = min(worksheet.max_row or 1, 15)
+        best_row = 1
+        best_score = -1
+        for row_idx in range(1, max_scan_row + 1):
+            non_empty = 0
+            text_cells = 0
+            numeric_like = 0
+            for col_idx in range(1, (worksheet.max_column or 1) + 1):
+                value = worksheet.cell(row=row_idx, column=col_idx).value
+                if value in (None, ""):
+                    continue
+                non_empty += 1
+                if isinstance(value, str):
+                    if value.startswith("="):
+                        numeric_like += 1
+                    else:
+                        text_cells += 1
+                elif isinstance(value, (int, float)) and not isinstance(value, bool):
+                    numeric_like += 1
+                elif hasattr(value, "year") and hasattr(value, "month"):
+                    text_cells += 1
+                else:
+                    text_cells += 1
+            score = (text_cells * 3) + (non_empty * 2) - numeric_like
+            if score > best_score:
+                best_score = score
+                best_row = row_idx
+        return best_row
+
+    def _data_start_row(self, worksheet: Worksheet) -> int:
+        return min(self._detect_header_row(worksheet) + 1, (worksheet.max_row or 1) + 1)
+
+    def find_columns_with_keywords(self, session_id: str, sheet_name: str, keywords: list[str], search_rows: int = 10) -> list[str]:
+        worksheet = self._get_sheet(self.get_session(session_id), sheet_name)
+        normalized_keywords = [self._normalize(keyword) for keyword in keywords if keyword]
+        if not normalized_keywords:
+            return []
+
+        matched_columns: list[str] = []
+        limit = min(worksheet.max_row or 1, max(1, search_rows))
+        for col_idx in range(1, (worksheet.max_column or 1) + 1):
+            for row_idx in range(1, limit + 1):
+                value = worksheet.cell(row=row_idx, column=col_idx).value
+                if not isinstance(value, str):
+                    continue
+                normalized_value = self._normalize(value)
+                if any(keyword in normalized_value for keyword in normalized_keywords):
+                    matched_columns.append(get_column_letter(col_idx))
+                    break
+        return matched_columns
 
     def _resolve_column_letter(self, worksheet: Worksheet, header_or_letter: str | None) -> str | None:
         if not header_or_letter:
@@ -962,6 +1042,27 @@ class WorkbookService:
     def _infer_type(values: list[Any]) -> str:
         if not values:
             return "empty"
+        numeric_like = 0
+        date_like = 0
+        text_like = 0
+        for value in values:
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                numeric_like += 1
+            elif isinstance(value, str) and value.startswith("="):
+                numeric_like += 1
+            elif hasattr(value, "year") and hasattr(value, "month"):
+                date_like += 1
+            else:
+                text_like += 1
+        total = len(values)
+        if numeric_like and numeric_like >= max(2, int(total * 0.6)):
+            return "number"
+        if date_like and date_like >= max(2, int(total * 0.6)):
+            return "date"
+        if numeric_like > text_like and numeric_like:
+            return "number"
+        if date_like > text_like and date_like:
+            return "date"
         if all(isinstance(value, (int, float)) and not isinstance(value, bool) for value in values):
             return "number"
         if all(hasattr(value, "year") and hasattr(value, "month") for value in values):

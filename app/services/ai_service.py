@@ -15,16 +15,22 @@ from app.services.workbook_service import workbook_service
 class AIService:
     async def preview_command(self, session_id: str, command: str) -> ActionPlan:
         snapshot = workbook_service.get_snapshot(session_id)
+        heuristic_plan = self._preview_with_heuristics(command, snapshot)
         if settings.gemini_api_key:
             try:
-                return await self._preview_with_gemini(command, snapshot)
+                gemini_plan = await self._preview_with_gemini(command, snapshot)
+                if gemini_plan.action == "noop" and heuristic_plan.action != "noop":
+                    return heuristic_plan
+                return gemini_plan
             except Exception as e:
                 import sys
                 import traceback
                 print(f"Gemini API Error: {repr(e)}", file=sys.stderr)
                 traceback.print_exc(file=sys.stderr)
-                return self._preview_with_heuristics(command, snapshot)
-        return self._preview_with_heuristics(command, snapshot)
+                if heuristic_plan.action == "noop":
+                    heuristic_plan.explanation = f"API Error: {repr(e)}. Original heuristic message: {heuristic_plan.explanation}"
+                return heuristic_plan
+        return heuristic_plan
 
     async def _preview_with_gemini(self, command: str, snapshot: WorkbookSnapshot) -> ActionPlan:
         prompt = self._build_prompt(command, snapshot)
@@ -43,7 +49,15 @@ class AIService:
         candidates = data.get("candidates") or []
         if not candidates:
             raise HTTPException(status_code=502, detail="Gemini returned no candidates.")
-        text = candidates[0]["content"]["parts"][0]["text"]
+        text = candidates[0]["content"]["parts"][0].get("text", "")
+        text = text.strip()
+        if text.startswith("```json"):
+            text = text[7:]
+        if text.startswith("```"):
+            text = text[3:]
+        if text.endswith("```"):
+            text = text[:-3]
+        text = text.strip()
         return ActionPlan.model_validate(json.loads(text))
 
     def _preview_with_heuristics(self, command: str, snapshot: WorkbookSnapshot) -> ActionPlan:
@@ -254,6 +268,11 @@ class AIService:
                     estimated_cells=hits,
                 ),
             )
+
+        if any(token in command_lower for token in ["profit", "net profit", "difference", "minus", "subtract", "revenue minus", "income minus", "collection minus"]):
+            difference_plan = self._build_difference_plan(command_lower, snapshot, target_sheet, sheet, matched_headers)
+            if difference_plan is not None:
+                return difference_plan
 
         if (
             any(token in command_lower for token in ["sumif", "averageif", "avgif", "countif"])
@@ -478,6 +497,107 @@ class AIService:
             requires_confirmation=False,
             parameters={},
             impact=ActionImpact(summary="No workbook changes will be made."),
+        )
+
+    def _build_difference_plan(
+        self,
+        command_lower: str,
+        snapshot: WorkbookSnapshot,
+        target_sheet: str,
+        sheet: dict[str, Any],
+        matched_headers: list[str],
+    ) -> ActionPlan | None:
+        header_row = workbook_service.detect_header_row(snapshot.session_id, target_sheet)
+        data_start_row = header_row + 1
+        target_column_letter = workbook_service.next_available_column_letter(snapshot.session_id, target_sheet)
+
+        explicit_match = re.search(
+            r"\b([a-z0-9 _&()-]+?)\s*(?:minus|subtract(?:ed)? by|less)\s*([a-z0-9 _&()-]+)\b",
+            command_lower,
+        )
+        left_column = None
+        right_column = None
+        if explicit_match:
+            left_token = explicit_match.group(1).strip()
+            right_token = explicit_match.group(2).strip()
+            left_column = workbook_service.header_to_column_letter(snapshot.session_id, target_sheet, left_token)
+            right_column = workbook_service.header_to_column_letter(snapshot.session_id, target_sheet, right_token)
+
+        if left_column is None or right_column is None:
+            grand_total_candidates = workbook_service.find_columns_with_keywords(
+                snapshot.session_id,
+                target_sheet,
+                ["grand total"],
+            )
+            if len(grand_total_candidates) >= 2:
+                left_column = grand_total_candidates[0]
+                right_column = grand_total_candidates[-1]
+
+        if left_column is None or right_column is None:
+            income_keywords = [
+                "grand total",
+                "income",
+                "collection",
+                "received",
+                "revenue",
+                "sales",
+                "earning",
+                "total income",
+                "total collection",
+            ]
+            expense_keywords = [
+                "grand total",
+                "expense",
+                "spend",
+                "spent",
+                "payment",
+                "cost",
+                "outflow",
+                "debit",
+                "total expense",
+            ]
+            income_candidates = workbook_service.find_columns_with_keywords(snapshot.session_id, target_sheet, income_keywords)
+            expense_candidates = workbook_service.find_columns_with_keywords(snapshot.session_id, target_sheet, expense_keywords)
+            if income_candidates:
+                left_column = income_candidates[0]
+            if expense_candidates:
+                right_column = expense_candidates[-1]
+
+        if (left_column is None or right_column is None) and len(sheet.get("numeric_headers") or []) >= 2:
+            left_header = next((header for header in matched_headers if header in sheet.get("numeric_headers", [])), None)
+            numeric_headers = list(sheet.get("numeric_headers") or [])
+            left_header = left_header or numeric_headers[0]
+            right_header = next((header for header in reversed(numeric_headers) if header != left_header), None)
+            left_column = left_column or workbook_service.header_to_column_letter(snapshot.session_id, target_sheet, left_header)
+            right_column = right_column or workbook_service.header_to_column_letter(snapshot.session_id, target_sheet, right_header)
+
+        if not left_column or not right_column or left_column == right_column:
+            return None
+
+        return ActionPlan(
+            action="fill_formula_down",
+            target_sheet=target_sheet,
+            target_column=target_column_letter,
+            preview_title="Insert profit formula",
+            explanation=(
+                f"I will calculate profit on {target_sheet} using {left_column} minus {right_column} "
+                f"and fill it down from row {data_start_row}."
+            ),
+            risk_level="low",
+            requires_confirmation=False,
+            impacted_range=f"{target_column_letter}{header_row}:{target_column_letter}{sheet['max_row']}",
+            formula=f"={left_column}{{row}}-{right_column}{{row}}",
+            parameters={
+                "start_row": data_start_row,
+                "end_row": sheet["max_row"],
+                "header_row": header_row,
+                "column_header": "Profit",
+            },
+            impact=ActionImpact(
+                summary=f"A Profit column will be created from {left_column} minus {right_column}.",
+                estimated_rows=max(0, sheet["max_row"] - data_start_row + 1),
+                estimated_cells=max(0, sheet["max_row"] - data_start_row + 1),
+            ),
         )
 
     def _build_prompt(self, command: str, snapshot: WorkbookSnapshot) -> str:
