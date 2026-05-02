@@ -98,7 +98,12 @@ def redo_workbook(payload: WorkbookSessionRequest) -> WorkbookSnapshot:
 
 @app.post("/api/commands/preview", response_model=CommandPreviewResponse)
 async def preview_command(payload: CommandPreviewRequest) -> CommandPreviewResponse:
-    plan = await ai_service.preview_command(payload.session_id, payload.command)
+    plan = await ai_service.preview_command(
+.``        payload.session_id,
+        payload.command,
+        payload.selected_cell,
+        payload.selected_value,
+    )
     snapshot = workbook_service.get_snapshot(payload.session_id)
     return CommandPreviewResponse(plan=plan, snapshot=snapshot)
 

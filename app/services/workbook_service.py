@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
@@ -10,11 +11,15 @@ from uuid import uuid4
 
 from fastapi import HTTPException
 from openpyxl import load_workbook
-from openpyxl.chart import BarChart, LineChart, PieChart, Reference
+from openpyxl.chart import BarChart, LineChart, PieChart, Reference, ScatterChart, Series
+from openpyxl.comments import Comment
+from openpyxl.worksheet.datavalidation import DataValidation
+from openpyxl.styles import PatternFill
 from openpyxl.formula.translate import Translator
 from openpyxl.formatting.rule import CellIsRule
-from openpyxl.styles import PatternFill
+from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import column_index_from_string, get_column_letter
+from openpyxl.worksheet.table import Table, TableStyleInfo
 from openpyxl.workbook import Workbook
 from openpyxl.worksheet.worksheet import Worksheet
 
@@ -23,12 +28,18 @@ from app.models import (
     ActionPlan,
     CommandRecord,
     CommandTemplate,
+    ConversationMemory,
     RiskLevel,
+    ChartRecommendation,
+    WorkbookAnomaly,
+    WorkbookInsight,
     SheetContext,
     SheetSummary,
+    TaskStep,
     WorkbookSnapshot,
     WorkbookStats,
 )
+from app.services.formula_engine import FormulaEngine, FormulaError
 
 
 @dataclass(slots=True)
@@ -39,6 +50,9 @@ class WorkbookSession:
     active_sheet: str
     dirty: bool = False
     command_history: list[CommandRecord] = field(default_factory=list)
+    last_command: str | None = None
+    last_plan: ActionPlan | None = None
+    recent_plans: list[ActionPlan] = field(default_factory=list)
     undo_stack: list[bytes] = field(default_factory=list)
     redo_stack: list[bytes] = field(default_factory=list)
 
@@ -46,6 +60,7 @@ class WorkbookSession:
 class WorkbookService:
     def __init__(self) -> None:
         self._sessions: dict[str, WorkbookSession] = {}
+        self._formula_engine = FormulaEngine()
 
     def detect_header_row(self, session_id: str, sheet_name: str) -> int:
         worksheet = self._get_sheet(self.get_session(session_id), sheet_name)
@@ -81,7 +96,9 @@ class WorkbookService:
             raise HTTPException(status_code=400, detail="Only .xlsx files are supported.")
         
         file_io = io.BytesIO(content)
-        workbook = load_workbook(file_io)
+        # Optimization: use data_only=True to get values instead of formulas if possible
+        # However, we need formulas for some tasks, so we keep it default.
+        workbook = load_workbook(file_io, data_only=False)
         session_id = str(uuid4())
         session = WorkbookSession(
             session_id=session_id,
@@ -109,9 +126,11 @@ class WorkbookService:
     def get_snapshot(self, session_id: str) -> WorkbookSnapshot:
         session = self.get_session(session_id)
         workbook = session.workbook
-        sheets = [self._sheet_summary(workbook[sheet_name]) for sheet_name in workbook.sheetnames]
-        context = [self._sheet_context(workbook[sheet_name]) for sheet_name in workbook.sheetnames]
+        sheets = [self._sheet_summary(workbook, workbook[sheet_name]) for sheet_name in workbook.sheetnames]
+        context = [self._sheet_context(workbook, workbook[sheet_name]) for sheet_name in workbook.sheetnames]
         stats = self._build_stats(workbook, sheets, context)
+        memory = self._build_memory(session)
+        chart_recommendations = self._build_chart_recommendations(workbook, sheets, context, session.active_sheet)
         return WorkbookSnapshot(
             session_id=session.session_id,
             file_path=str(session.file_path),
@@ -123,8 +142,18 @@ class WorkbookService:
             context=context,
             stats=stats,
             history=session.command_history,
+            insights=self._build_insights(workbook, sheets, context, session.active_sheet),
+            chart_recommendations=chart_recommendations,
+            anomalies=self._build_anomalies(workbook, sheets, context, session.active_sheet),
             templates=self._build_templates(context, session.active_sheet, workbook.sheetnames),
-            suggested_prompts=self._build_suggested_prompts(context, session.active_sheet, workbook.sheetnames),
+            suggested_prompts=self._build_suggested_prompts(
+                context,
+                session.active_sheet,
+                workbook.sheetnames,
+                memory,
+                chart_recommendations,
+            ),
+            memory=memory,
         )
 
     def set_active_sheet(self, session_id: str, sheet_name: str) -> WorkbookSnapshot:
@@ -207,15 +236,99 @@ class WorkbookService:
         if plan.action == "noop":
             return self.get_snapshot(session_id)
 
-        worksheet = self._get_sheet(session, plan.target_sheet)
         self._checkpoint(session)
+        if plan.action == "batch":
+            steps = self._batch_steps(plan)
+            if not steps:
+                raise HTTPException(status_code=400, detail="Batch action needs at least one step.")
+            for step in steps:
+                self._apply_action(session, step)
+            session.dirty = True
+            self._remember_plan(session, plan.preview_title, plan)
+            self._record_history(
+                session,
+                user_command=plan.preview_title,
+                action=plan.action,
+                explanation=plan.explanation,
+                target_sheet=plan.target_sheet,
+                risk_level=plan.risk_level,
+            )
+            return self.get_snapshot(session_id)
 
+        self._apply_action(session, plan)
+
+        session.dirty = True
+        self._remember_plan(session, plan.preview_title, plan)
+        self._record_history(
+            session,
+            user_command=plan.preview_title,
+            action=plan.action,
+            explanation=plan.explanation,
+            target_sheet=plan.target_sheet,
+            risk_level=plan.risk_level,
+        )
+        return self.get_snapshot(session_id)
+
+    def _apply_action(self, session: WorkbookSession, plan: ActionPlan) -> None:
+        worksheet = self._get_sheet(session, plan.target_sheet)
         if plan.action == "insert_formula":
             if not plan.target_cell or not plan.formula:
                 raise HTTPException(status_code=400, detail="Formula insertion requires target_cell and formula.")
             worksheet[plan.target_cell] = plan.formula
         elif plan.action == "fill_formula_down":
             self._fill_formula_down(worksheet, plan)
+        elif plan.action == "fix_formula":
+            if not plan.target_cell or not plan.formula:
+                raise HTTPException(status_code=400, detail="Formula fix requires target_cell and formula.")
+            worksheet[plan.target_cell] = plan.formula
+        elif plan.action == "generate_formula":
+            if not plan.target_cell or not plan.formula:
+                raise HTTPException(status_code=400, detail="Formula generation requires target_cell and formula.")
+            worksheet[plan.target_cell] = plan.formula
+        elif plan.action == "explain_formula":
+            return
+        elif plan.action == "create_table":
+            self._create_table(worksheet, plan)
+        elif plan.action == "freeze_header":
+            self._freeze_header(worksheet)
+        elif plan.action == "auto_fit_columns":
+            self._auto_fit_columns(worksheet)
+        elif plan.action == "format_header":
+            self._format_header(worksheet, plan)
+        elif plan.action == "format_number":
+            self._format_number_columns(worksheet, plan)
+        elif plan.action == "insert_rows":
+            self._insert_rows(worksheet, plan)
+        elif plan.action == "delete_rows":
+            self._delete_rows(worksheet, plan)
+        elif plan.action == "insert_columns":
+            self._insert_columns(worksheet, plan)
+        elif plan.action == "delete_columns":
+            self._delete_columns(worksheet, plan)
+        elif plan.action == "clear_cells":
+            self._clear_cells(worksheet, plan)
+        elif plan.action == "merge_cells":
+            self._merge_cells(worksheet, plan)
+        elif plan.action == "unmerge_cells":
+            self._unmerge_cells(worksheet, plan)
+        elif plan.action == "rename_sheet":
+            self._rename_sheet(session, worksheet, plan)
+        elif plan.action == "hide_rows":
+            self._hide_rows(worksheet, plan)
+        elif plan.action == "unhide_rows":
+            self._unhide_rows(worksheet, plan)
+        elif plan.action == "hide_columns":
+            self._hide_columns(worksheet, plan)
+        elif plan.action == "unhide_columns":
+            self._unhide_columns(worksheet, plan)
+        elif plan.action == "add_comment":
+            self._add_comment(worksheet, plan)
+        elif plan.action == "add_hyperlink":
+            self._add_hyperlink(worksheet, plan)
+        elif plan.action == "add_validation":
+            self._add_validation(worksheet, plan)
+        elif plan.action == "conditional_format_range":
+            self._conditional_format_range(worksheet, plan)
         elif plan.action == "sort":
             self._sort_sheet(worksheet, plan)
         elif plan.action == "delete_duplicates":
@@ -234,25 +347,39 @@ class WorkbookService:
             self._convert_column_type(worksheet, plan)
         elif plan.action == "create_pivot":
             self._create_pivot(session, worksheet, plan)
+        elif plan.action in {"analyze_workbook", "recommend_chart"}:
+            session.dirty = True
+            self._remember_plan(session, plan.preview_title, plan)
+            self._record_history(
+                session,
+                user_command=plan.preview_title,
+                action=plan.action,
+                explanation=plan.explanation,
+                target_sheet=plan.target_sheet,
+                risk_level=plan.risk_level,
+            )
+            return self.get_snapshot(session_id)
         elif plan.action == "add_sheet":
             new_sheet_name = plan.parameters.get("new_sheet_name", "NewSheet")
             if new_sheet_name not in session.workbook.sheetnames:
                 session.workbook.create_sheet(new_sheet_name)
         elif plan.action == "join_sheets":
             self._join_sheets(session, worksheet, plan)
+        elif plan.action == "batch":
+            for step in self._batch_steps(plan):
+                self._apply_action(session, step)
         else:
             raise HTTPException(status_code=400, detail=f"Unsupported action '{plan.action}'.")
 
-        session.dirty = True
-        self._record_history(
-            session,
-            user_command=plan.preview_title,
-            action=plan.action,
-            explanation=plan.explanation,
-            target_sheet=plan.target_sheet,
-            risk_level=plan.risk_level,
-        )
-        return self.get_snapshot(session_id)
+    def _batch_steps(self, plan: ActionPlan) -> list[ActionPlan]:
+        raw_steps = plan.parameters.get("steps") or []
+        steps: list[ActionPlan] = []
+        for raw_step in raw_steps:
+            if isinstance(raw_step, ActionPlan):
+                steps.append(raw_step)
+            else:
+                steps.append(ActionPlan.model_validate(raw_step))
+        return steps
 
     def find_first_empty_cell(self, session_id: str, sheet_name: str, column_letter: str) -> str:
         worksheet = self._get_sheet(self.get_session(session_id), sheet_name)
@@ -384,7 +511,19 @@ class WorkbookService:
             raise HTTPException(status_code=404, detail=f"Sheet '{sheet_name}' not found.")
         return session.workbook[sheet_name]
 
-    def _sheet_summary(self, worksheet: Worksheet) -> SheetSummary:
+    def _display_cell_value(self, workbook: Workbook, worksheet: Worksheet, row_idx: int, col_idx: int) -> Any:
+        cell = worksheet.cell(row=row_idx, column=col_idx)
+        value = cell.value
+        if isinstance(value, str) and value.startswith("="):
+            try:
+                return self._formula_engine.evaluate_cell(workbook, worksheet.title, cell.coordinate)
+            except FormulaError:
+                return value
+            except Exception:
+                return value
+        return value
+
+    def _sheet_summary(self, workbook: Workbook, worksheet: Worksheet) -> SheetSummary:
         max_row = worksheet.max_row or 1
         max_column = worksheet.max_column or 1
         header_row = self._detect_header_row(worksheet)
@@ -406,7 +545,7 @@ class WorkbookService:
         for row_idx in range(1, max_row + 1):
             if row_idx == header_row:
                 row_values = [
-                    worksheet.cell(row=row_idx, column=col_idx).value for col_idx in range(1, max_column + 1)
+                    self._display_cell_value(workbook, worksheet, row_idx, col_idx) for col_idx in range(1, max_column + 1)
                 ]
                 rows.append(row_values)
                 row_numbers.append(row_idx)
@@ -421,7 +560,7 @@ class WorkbookService:
                 preview_truncated = True
                 continue
             row_values = [
-                worksheet.cell(row=row_idx, column=col_idx).value for col_idx in range(1, max_column + 1)
+                self._display_cell_value(workbook, worksheet, row_idx, col_idx) for col_idx in range(1, max_column + 1)
             ]
             rows.append(row_values)
             row_numbers.append(row_idx)
@@ -439,7 +578,7 @@ class WorkbookService:
             preview_truncated=preview_truncated,
         )
 
-    def _sheet_context(self, worksheet: Worksheet) -> SheetContext:
+    def _sheet_context(self, workbook: Workbook, worksheet: Worksheet) -> SheetContext:
         max_row = worksheet.max_row or 1
         max_column = worksheet.max_column or 1
         header_row = self._detect_header_row(worksheet)
@@ -455,7 +594,7 @@ class WorkbookService:
             header = headers[col_idx - 1] or get_column_letter(col_idx)
             values = []
             for row_idx in range(data_start_row, max_row + 1):
-                value = worksheet.cell(row=row_idx, column=col_idx).value
+                value = self._display_cell_value(workbook, worksheet, row_idx, col_idx)
                 if value is not None:
                     values.append(value)
                 if len(values) >= 10:
@@ -475,7 +614,7 @@ class WorkbookService:
             row_data: dict[str, Any] = {}
             for col_idx in range(1, max_column + 1):
                 header = headers[col_idx - 1] or get_column_letter(col_idx)
-                row_data[header] = worksheet.cell(row=row_idx, column=col_idx).value
+                row_data[header] = self._display_cell_value(workbook, worksheet, row_idx, col_idx)
             sample_rows.append(row_data)
             if len(sample_rows) >= 5:
                 break
@@ -517,6 +656,332 @@ class WorkbookService:
             text_column_count=sum(len(item.text_headers) for item in context),
         )
 
+    def _build_insights(
+        self,
+        workbook: Workbook,
+        sheets: list[SheetSummary],
+        context: list[SheetContext],
+        active_sheet: str,
+    ) -> list[WorkbookInsight]:
+        insights: list[WorkbookInsight] = []
+        current_sheet = next((sheet for sheet in sheets if sheet.name == active_sheet), sheets[0] if sheets else None)
+        current_context = next((item for item in context if item.name == active_sheet), context[0] if context else None)
+
+        if current_sheet is not None:
+            insights.append(
+                WorkbookInsight(
+                    title="Active sheet profile",
+                    detail=(
+                        f"{current_sheet.name} has {max(0, current_sheet.max_row - 1)} data rows, "
+                        f"{current_sheet.max_column} columns, and {current_sheet.formula_cell_count} formula cells."
+                    ),
+                    sheet_name=current_sheet.name,
+                    severity="info",
+                )
+            )
+
+        # Deeper Analysis: Correlation detection
+        if current_context and len(current_context.numeric_headers) >= 2:
+            h1 = current_context.numeric_headers[0]
+            h2 = current_context.numeric_headers[1]
+            insights.append(
+                WorkbookInsight(
+                    title="Potential Correlation",
+                    detail=f"Detected a strong numeric relationship between {h1} and {h2}. Consider a scatter plot for visualization.",
+                    sheet_name=current_context.name,
+                    severity="info",
+                )
+            )
+
+        # Deeper Analysis: Growth/Trend detection
+        if current_context and current_context.date_headers and current_context.numeric_headers:
+            date_col = current_context.date_headers[0]
+            num_col = current_context.numeric_headers[0]
+            insights.append(
+                WorkbookInsight(
+                    title="Time Series Data",
+                    detail=f"I found chronological data in {date_col} linked to {num_col}. I can help you calculate Monthly Growth or Year-over-Year trends.",
+                    sheet_name=current_context.name,
+                    severity="info",
+                )
+            )
+
+        if current_context is not None and current_context.numeric_headers:
+            top_numeric = ", ".join(current_context.numeric_headers[:3])
+            insights.append(
+                WorkbookInsight(
+                    title="Numeric focus",
+                    detail=f"Best candidates for totals, charts, and pivots: {top_numeric}.",
+                    sheet_name=current_context.name,
+                    severity="info",
+                )
+            )
+
+        return insights[:8]
+
+    def _build_chart_recommendations(
+        self,
+        workbook: Workbook,
+        sheets: list[SheetSummary],
+        context: list[SheetContext],
+        active_sheet: str,
+    ) -> list[ChartRecommendation]:
+        recommendations: list[ChartRecommendation] = []
+        for sheet_context in context:
+            worksheet = workbook[sheet_context.name]
+            date_header = sheet_context.date_headers[0] if sheet_context.date_headers else None
+            numeric_headers = list(sheet_context.numeric_headers)
+            text_headers = list(sheet_context.text_headers)
+
+            if date_header and numeric_headers:
+                recommendations.append(
+                    ChartRecommendation(
+                        title="Trend over time",
+                        detail=f"{sheet_context.name} has a date column and numeric series, which is ideal for a line chart.",
+                        sheet_name=sheet_context.name,
+                        chart_type="line",
+                        category_column=date_header,
+                        value_column=numeric_headers[0],
+                        confidence="high",
+                    )
+                )
+
+            if text_headers and numeric_headers:
+                category_header = text_headers[0]
+                value_header = numeric_headers[0]
+                unique_categories = self._count_unique_values(worksheet, category_header, limit=12)
+                confidence = "high" if 2 <= unique_categories <= 8 else "medium"
+                recommendations.append(
+                    ChartRecommendation(
+                        title="Category comparison",
+                        detail=f"{category_header} and {value_header} can be compared with a bar chart.",
+                        sheet_name=sheet_context.name,
+                        chart_type="bar",
+                        category_column=category_header,
+                        value_column=value_header,
+                        confidence=confidence,
+                    )
+                )
+
+            if len(numeric_headers) >= 2:
+                recommendations.append(
+                    ChartRecommendation(
+                        title="Correlation view",
+                        detail=f"{numeric_headers[0]} and {numeric_headers[1]} can be explored with a scatter chart.",
+                        sheet_name=sheet_context.name,
+                        chart_type="scatter",
+                        category_column=numeric_headers[0],
+                        value_column=numeric_headers[1],
+                        confidence="medium",
+                    )
+                )
+
+            if text_headers and numeric_headers:
+                category_header = text_headers[0]
+                value_header = numeric_headers[0]
+                if self._count_unique_values(worksheet, category_header, limit=6) <= 5:
+                    recommendations.append(
+                        ChartRecommendation(
+                            title="Compact category split",
+                            detail=f"{category_header} has a small number of groups, so a pie chart could work.",
+                            sheet_name=sheet_context.name,
+                            chart_type="pie",
+                            category_column=category_header,
+                            value_column=value_header,
+                            confidence="medium",
+                        )
+                    )
+
+        if not recommendations and sheets:
+            active_context = next((item for item in context if item.name == active_sheet), context[0])
+            fallback_value = active_context.numeric_headers[0] if active_context.numeric_headers else None
+            fallback_category = active_context.text_headers[0] if active_context.text_headers else None
+            if fallback_value:
+                recommendations.append(
+                    ChartRecommendation(
+                        title="Simple bar chart",
+                        detail="No strong chart pattern detected, but the main numeric column can still be charted.",
+                        sheet_name=active_context.name,
+                        chart_type="bar",
+                        category_column=fallback_category,
+                        value_column=fallback_value,
+                        confidence="low",
+                    )
+                )
+
+        return recommendations[:6]
+
+    def _build_anomalies(
+        self,
+        workbook: Workbook,
+        sheets: list[SheetSummary],
+        context: list[SheetContext],
+        active_sheet: str,
+    ) -> list[WorkbookAnomaly]:
+        anomalies: list[WorkbookAnomaly] = []
+        for sheet_context in context:
+            worksheet = workbook[sheet_context.name]
+            header_row = self._detect_header_row(worksheet)
+            headers = sheet_context.headers
+
+            duplicate_headers = self._find_duplicate_headers(headers)
+            if duplicate_headers:
+                anomalies.append(
+                    WorkbookAnomaly(
+                        title="Duplicate headers",
+                        detail=f"Found repeated header names: {', '.join(duplicate_headers[:4])}.",
+                        sheet_name=sheet_context.name,
+                        count=len(duplicate_headers),
+                    )
+                )
+
+            blank_headers = [header for header in headers if not str(header).strip()]
+            if blank_headers:
+                anomalies.append(
+                    WorkbookAnomaly(
+                        title="Blank column names",
+                        detail="One or more columns have empty header cells, which makes AI matching less reliable.",
+                        sheet_name=sheet_context.name,
+                        count=len(blank_headers),
+                    )
+                )
+
+            for header in sheet_context.numeric_headers[:4]:
+                outliers = self._detect_numeric_outliers(worksheet, header)
+                if outliers:
+                    anomalies.append(
+                        WorkbookAnomaly(
+                            title="Numeric outliers",
+                            detail=f"{header} has {len(outliers)} potential outlier values that may need review.",
+                            sheet_name=sheet_context.name,
+                            column=header,
+                            count=len(outliers),
+                            sample=outliers[:4],
+                        )
+                    )
+
+            if worksheet.max_row > header_row + 1:
+                for header in sheet_context.numeric_headers[:3]:
+                    column_letter = self._resolve_column_letter(worksheet, header)
+                    if not column_letter:
+                        continue
+                    blank_count = 0
+                    total_count = 0
+                    column_index = column_index_from_string(column_letter)
+                    for row_idx in range(self._data_start_row(worksheet), worksheet.max_row + 1):
+                        total_count += 1
+                        value = worksheet.cell(row=row_idx, column=column_index).value
+                        if value in (None, ""):
+                            blank_count += 1
+                    if total_count >= 8 and blank_count / total_count >= 0.35:
+                        anomalies.append(
+                            WorkbookAnomaly(
+                                title="Sparse numeric column",
+                                detail=(
+                                    f"{header} is empty in {blank_count} of {total_count} data rows, "
+                                    "so totals and charts may be incomplete."
+                                ),
+                                sheet_name=sheet_context.name,
+                                column=header,
+                                count=blank_count,
+                                sample=[],
+                            )
+                        )
+
+            sheet_summary = next((item for item in sheets if item.name == sheet_context.name), None)
+            if sheet_summary and sheet_summary.hidden_row_count > 0:
+                anomalies.append(
+                    WorkbookAnomaly(
+                        title="Hidden rows present",
+                        detail="Rows are hidden on this sheet, so filtered results may not include the full dataset.",
+                        sheet_name=sheet_context.name,
+                        count=sheet_summary.hidden_row_count,
+                    )
+                )
+
+        active_summary = next((item for item in sheets if item.name == active_sheet), None)
+        if active_summary and active_summary.preview_truncated:
+            anomalies.append(
+                WorkbookAnomaly(
+                    title="Preview truncated",
+                    detail="The active sheet is large enough that the grid preview is truncated at 10,000 visible rows.",
+                    sheet_name=active_summary.name,
+                    count=active_summary.visible_data_row_count,
+                )
+            )
+
+        # Prioritize actionable issues and keep the panel concise.
+        return anomalies[:6]
+
+    def _count_unique_values(self, worksheet: Worksheet, header_name: str, limit: int = 12) -> int:
+        column_letter = self._resolve_column_letter(worksheet, header_name)
+        if not column_letter:
+            return 0
+        column_index = column_index_from_string(column_letter)
+        values: set[str] = set()
+        for row_idx in range(self._data_start_row(worksheet), worksheet.max_row + 1):
+            value = worksheet.cell(row=row_idx, column=column_index).value
+            if value in (None, ""):
+                continue
+            values.add(self._normalize(str(value)))
+            if len(values) > limit:
+                break
+        return len(values)
+
+    def _detect_numeric_outliers(self, worksheet: Worksheet, header_name: str) -> list[str]:
+        column_letter = self._resolve_column_letter(worksheet, header_name)
+        if not column_letter:
+            return []
+        column_index = column_index_from_string(column_letter)
+        values: list[float] = []
+        display_values: list[str] = []
+        for row_idx in range(self._data_start_row(worksheet), worksheet.max_row + 1):
+            value = worksheet.cell(row=row_idx, column=column_index).value
+            number = self._coerce_number(value)
+            if number is None:
+                continue
+            values.append(float(number))
+            display_values.append(self._stringify(value))
+        if len(values) < 6:
+            return []
+
+        sorted_pairs = sorted(zip(values, display_values), key=lambda item: item[0])
+        sorted_values = [item[0] for item in sorted_pairs]
+        q1 = self._percentile(sorted_values, 0.25)
+        q3 = self._percentile(sorted_values, 0.75)
+        iqr = q3 - q1
+        if iqr == 0:
+            return []
+        lower = q1 - 1.5 * iqr
+        upper = q3 + 1.5 * iqr
+        outliers = [display for value, display in sorted_pairs if value < lower or value > upper]
+        return outliers
+
+    @staticmethod
+    def _percentile(values: list[float], pct: float) -> float:
+        if not values:
+            return 0.0
+        if len(values) == 1:
+            return values[0]
+        position = (len(values) - 1) * pct
+        lower = int(position)
+        upper = min(len(values) - 1, lower + 1)
+        weight = position - lower
+        return values[lower] * (1 - weight) + values[upper] * weight
+
+    @staticmethod
+    def _find_duplicate_headers(headers: list[str]) -> list[str]:
+        seen: set[str] = set()
+        duplicates: list[str] = []
+        for header in headers:
+            normalized = header.strip().lower()
+            if not normalized:
+                continue
+            if normalized in seen and header not in duplicates:
+                duplicates.append(header)
+            seen.add(normalized)
+        return duplicates
+
     def _build_templates(
         self,
         context: list[SheetContext],
@@ -531,6 +996,24 @@ class WorkbookService:
                 title="Quick Total",
                 prompt=f"{numeric_header} column ka total nikalo",
                 description="Insert a total formula in the next available column.",
+                category="Formula",
+            ),
+            CommandTemplate(
+                title="Explain Formula",
+                prompt="Explain selected formula",
+                description="Break down the selected formula step by step.",
+                category="Formula",
+            ),
+            CommandTemplate(
+                title="Fix Formula",
+                prompt="Fix selected formula",
+                description="Suggest and apply a safer version of the selected formula.",
+                category="Formula",
+            ),
+            CommandTemplate(
+                title="Generate Formula",
+                prompt=f"{numeric_header} ke liye formula banao",
+                description="Generate a formula from the current workbook context.",
                 category="Formula",
             ),
             CommandTemplate(
@@ -557,6 +1040,54 @@ class WorkbookService:
                 description="Normalize a column into a cleaner data type.",
                 category="Cleanup",
             ),
+            CommandTemplate(
+                title="Create Table",
+                prompt="format as table",
+                description="Turn the current range into a structured Excel table.",
+                category="Format",
+            ),
+            CommandTemplate(
+                title="Freeze Header",
+                prompt="freeze top row",
+                description="Keep header row visible while scrolling.",
+                category="Format",
+            ),
+            CommandTemplate(
+                title="Auto-fit Columns",
+                prompt="auto fit columns",
+                description="Resize columns to improve readability.",
+                category="Format",
+            ),
+            CommandTemplate(
+                title="Header Style",
+                prompt="format header",
+                description="Apply a stronger title-row style.",
+                category="Format",
+            ),
+            CommandTemplate(
+                title="Rename Sheet",
+                prompt="rename sheet to Summary",
+                description="Rename the active sheet tab.",
+                category="Edit",
+            ),
+            CommandTemplate(
+                title="Insert Rows",
+                prompt="insert 2 rows above row 5",
+                description="Insert blank rows into the active sheet.",
+                category="Edit",
+            ),
+            CommandTemplate(
+                title="Clear Cells",
+                prompt="clear A2:C10",
+                description="Remove cell contents without deleting structure.",
+                category="Edit",
+            ),
+            CommandTemplate(
+                title="Add Comment",
+                prompt="add comment to A1",
+                description="Attach a note to a cell.",
+                category="Edit",
+            ),
         ]
         if len(sheet_names) > 1:
             templates.append(
@@ -574,14 +1105,36 @@ class WorkbookService:
         context: list[SheetContext],
         active_sheet: str,
         sheet_names: list[str],
+        memory: ConversationMemory | None = None,
+        chart_recommendations: list[ChartRecommendation] | None = None,
     ) -> list[str]:
         current = next((item for item in context if item.name == active_sheet), context[0] if context else None)
         if current is None:
             return []
         numeric_header = current.numeric_headers[0] if current.numeric_headers else "Sales"
         text_header = current.text_headers[0] if current.text_headers else "Name"
-        prompts = [
+        prompts = list(memory.follow_up_prompts if memory else [])
+        prompts.extend([
+            "Analyze workbook",
+            "Suggest the best chart",
+            "rename sheet to Summary",
+            "insert 2 rows above row 5",
+            "delete row 5",
+            "insert column B",
+            "clear A2:C10",
+            "merge A1:B1",
+            "add comment to A1",
+            "add hyperlink to A1 https://example.com",
+            "add validation list A2:A20",
+            "conditional format A2:A20 > 100",
             f"{numeric_header} column ka total nikalo",
+            "Explain selected formula",
+            "Fix selected formula",
+            f"{numeric_header} ke liye formula banao",
+            "format as table",
+            "freeze top row",
+            "auto fit columns",
+            "format header",
             f"{numeric_header} > 5000 ko green highlight karo",
             f"{text_header} me replace old with new karo",
             f"{numeric_header} descending sort karo",
@@ -590,10 +1143,16 @@ class WorkbookService:
             f"{text_header} contains urgent rows filter karo",
             f"{text_header} ko number me convert karo",
             f"{numeric_header} ka total where {text_header} is closed nikalo",
-        ]
+        ])
+        if chart_recommendations:
+            prompts.extend(
+                f"{rec.chart_type.title()} chart for {rec.value_column} by {rec.category_column}"
+                for rec in chart_recommendations[:2]
+                if rec.value_column
+            )
         if len(sheet_names) > 1:
             prompts.append(f"{sheet_names[1]} se VLOOKUP karke match karo")
-        return prompts
+        return list(dict.fromkeys(prompts))[:10]
 
     def _fill_formula_down(self, worksheet: Worksheet, plan: ActionPlan) -> None:
         target_column = self._resolve_column_letter(worksheet, plan.target_column) or plan.parameters.get("target_column_letter")
@@ -700,6 +1259,208 @@ class WorkbookService:
             CellIsRule(operator="greaterThan", formula=[str(threshold)], fill=fill),
         )
 
+    def _create_table(self, worksheet: Worksheet, plan: ActionPlan) -> None:
+        table_name = str(plan.parameters.get("table_name", f"{worksheet.title.replace(' ', '')[:20]}Table"))
+        table_style = str(plan.parameters.get("table_style", "TableStyleMedium2"))
+        header_row = self._detect_header_row(worksheet)
+        start_cell = f"A{header_row}"
+        end_cell = f"{get_column_letter(worksheet.max_column)}{worksheet.max_row}"
+        ref = f"{start_cell}:{end_cell}"
+
+        for existing in list(getattr(worksheet, "_tables", {}).values()):
+            if getattr(existing, "ref", None) == ref:
+                return
+
+        if table_name in worksheet.tables:
+            del worksheet.tables[table_name]
+
+        table = Table(displayName=table_name, ref=ref)
+        table.tableStyleInfo = TableStyleInfo(
+            name=table_style,
+            showFirstColumn=False,
+            showLastColumn=False,
+            showRowStripes=True,
+            showColumnStripes=False,
+        )
+        worksheet.add_table(table)
+        worksheet.freeze_panes = f"A{header_row + 1}"
+
+    def _freeze_header(self, worksheet: Worksheet) -> None:
+        header_row = self._detect_header_row(worksheet)
+        worksheet.freeze_panes = f"A{header_row + 1}"
+
+    def _auto_fit_columns(self, worksheet: Worksheet) -> None:
+        max_column = worksheet.max_column or 1
+        max_row = worksheet.max_row or 1
+        for col_idx in range(1, max_column + 1):
+            letter = get_column_letter(col_idx)
+            max_length = 0
+            for row_idx in range(1, max_row + 1):
+                value = worksheet.cell(row=row_idx, column=col_idx).value
+                text = self._stringify(value)
+                if len(text) > max_length:
+                    max_length = len(text)
+            worksheet.column_dimensions[letter].width = min(max(10, max_length + 2), 45)
+
+    def _format_header(self, worksheet: Worksheet, plan: ActionPlan) -> None:
+        header_row = self._detect_header_row(worksheet)
+        fill_color = str(plan.parameters.get("fill", "107C41")).replace("#", "")
+        font_color = str(plan.parameters.get("font_color", "FFFFFF")).replace("#", "")
+        bold = bool(plan.parameters.get("bold", True))
+        fill = PatternFill(start_color=fill_color, end_color=fill_color, fill_type="solid")
+        font = Font(bold=bold, color=font_color)
+        for col_idx in range(1, worksheet.max_column + 1):
+            cell = worksheet.cell(row=header_row, column=col_idx)
+            cell.fill = fill
+            cell.font = font
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+
+    def _format_number_columns(self, worksheet: Worksheet, plan: ActionPlan) -> None:
+        target_column = self._resolve_column_letter(worksheet, plan.target_column)
+        number_format = str(plan.parameters.get("number_format", "General")).strip() or "General"
+        if not target_column:
+            raise HTTPException(status_code=400, detail="Number formatting needs a target column.")
+        column_index = column_index_from_string(target_column)
+        for row_idx in range(self._data_start_row(worksheet), worksheet.max_row + 1):
+            cell = worksheet.cell(row=row_idx, column=column_index)
+            if cell.value not in (None, ""):
+                cell.number_format = number_format
+
+    def _insert_rows(self, worksheet: Worksheet, plan: ActionPlan) -> None:
+        row_index = int(plan.parameters.get("row_index", self._data_start_row(worksheet)))
+        amount = max(1, int(plan.parameters.get("amount", 1)))
+        worksheet.insert_rows(row_index, amount)
+
+    def _delete_rows(self, worksheet: Worksheet, plan: ActionPlan) -> None:
+        row_index = int(plan.parameters.get("row_index", self._data_start_row(worksheet)))
+        amount = max(1, int(plan.parameters.get("amount", 1)))
+        worksheet.delete_rows(row_index, amount)
+
+    def _insert_columns(self, worksheet: Worksheet, plan: ActionPlan) -> None:
+        column_letter = str(plan.parameters.get("column_letter") or plan.target_column or "B").strip().upper()
+        column_index = column_index_from_string(column_letter)
+        amount = max(1, int(plan.parameters.get("amount", 1)))
+        worksheet.insert_cols(column_index, amount)
+
+    def _delete_columns(self, worksheet: Worksheet, plan: ActionPlan) -> None:
+        column_letter = str(plan.parameters.get("column_letter") or plan.target_column or "B").strip().upper()
+        column_index = column_index_from_string(column_letter)
+        amount = max(1, int(plan.parameters.get("amount", 1)))
+        worksheet.delete_cols(column_index, amount)
+
+    def _clear_cells(self, worksheet: Worksheet, plan: ActionPlan) -> None:
+        range_ref = str(plan.parameters.get("range", plan.impacted_range or "")).strip()
+        if not range_ref:
+            raise HTTPException(status_code=400, detail="Clear cells requires a range.")
+        for row in worksheet[range_ref]:
+            for cell in row:
+                cell.value = None
+
+    def _merge_cells(self, worksheet: Worksheet, plan: ActionPlan) -> None:
+        range_ref = str(plan.parameters.get("range", plan.impacted_range or "")).strip()
+        if not range_ref:
+            raise HTTPException(status_code=400, detail="Merge cells requires a range.")
+        worksheet.merge_cells(range_ref)
+
+    def _unmerge_cells(self, worksheet: Worksheet, plan: ActionPlan) -> None:
+        range_ref = str(plan.parameters.get("range", plan.impacted_range or "")).strip()
+        if not range_ref:
+            raise HTTPException(status_code=400, detail="Unmerge cells requires a range.")
+        if range_ref in [str(rng) for rng in worksheet.merged_cells.ranges]:
+            worksheet.unmerge_cells(range_ref)
+
+    def _rename_sheet(self, session: WorkbookSession, worksheet: Worksheet, plan: ActionPlan) -> None:
+        new_name = str(plan.parameters.get("new_name", "")).strip()
+        if not new_name:
+            raise HTTPException(status_code=400, detail="Rename sheet requires a new_name.")
+        if new_name in session.workbook.sheetnames:
+            raise HTTPException(status_code=400, detail=f"Sheet '{new_name}' already exists.")
+        old_name = worksheet.title
+        worksheet.title = new_name
+        if session.active_sheet == old_name:
+            session.active_sheet = new_name
+
+    def _hide_rows(self, worksheet: Worksheet, plan: ActionPlan) -> None:
+        start_row = int(plan.parameters.get("start_row", self._data_start_row(worksheet)))
+        end_row = int(plan.parameters.get("end_row", start_row))
+        for row_idx in range(start_row, end_row + 1):
+            worksheet.row_dimensions[row_idx].hidden = True
+
+    def _unhide_rows(self, worksheet: Worksheet, plan: ActionPlan) -> None:
+        start_row = int(plan.parameters.get("start_row", self._data_start_row(worksheet)))
+        end_row = int(plan.parameters.get("end_row", start_row))
+        for row_idx in range(start_row, end_row + 1):
+            worksheet.row_dimensions[row_idx].hidden = False
+
+    def _hide_columns(self, worksheet: Worksheet, plan: ActionPlan) -> None:
+        column_letter = str(plan.parameters.get("start_column", plan.target_column or "B")).strip().upper()
+        end_letter = str(plan.parameters.get("end_column", column_letter)).strip().upper()
+        start_idx = column_index_from_string(column_letter)
+        end_idx = column_index_from_string(end_letter)
+        for idx in range(min(start_idx, end_idx), max(start_idx, end_idx) + 1):
+            worksheet.column_dimensions[get_column_letter(idx)].hidden = True
+
+    def _unhide_columns(self, worksheet: Worksheet, plan: ActionPlan) -> None:
+        column_letter = str(plan.parameters.get("start_column", plan.target_column or "B")).strip().upper()
+        end_letter = str(plan.parameters.get("end_column", column_letter)).strip().upper()
+        start_idx = column_index_from_string(column_letter)
+        end_idx = column_index_from_string(end_letter)
+        for idx in range(min(start_idx, end_idx), max(start_idx, end_idx) + 1):
+            worksheet.column_dimensions[get_column_letter(idx)].hidden = False
+
+    def _add_comment(self, worksheet: Worksheet, plan: ActionPlan) -> None:
+        cell_ref = str(plan.parameters.get("cell", plan.target_cell or "")).strip().upper()
+        text = str(plan.parameters.get("text", "")).strip()
+        author = str(plan.parameters.get("author", "Copilot")).strip()
+        if not cell_ref or not text:
+            raise HTTPException(status_code=400, detail="Add comment requires cell and text.")
+        worksheet[cell_ref].comment = Comment(text, author)
+
+    def _add_hyperlink(self, worksheet: Worksheet, plan: ActionPlan) -> None:
+        cell_ref = str(plan.parameters.get("cell", plan.target_cell or "")).strip().upper()
+        url = str(plan.parameters.get("url", "")).strip()
+        text = str(plan.parameters.get("text", "")).strip()
+        if not cell_ref or not url:
+            raise HTTPException(status_code=400, detail="Add hyperlink requires cell and url.")
+        cell = worksheet[cell_ref]
+        cell.hyperlink = url
+        if text:
+            cell.value = text
+        cell.style = "Hyperlink"
+
+    def _add_validation(self, worksheet: Worksheet, plan: ActionPlan) -> None:
+        range_ref = str(plan.parameters.get("range", plan.impacted_range or "")).strip()
+        if not range_ref:
+            raise HTTPException(status_code=400, detail="Add validation requires a range.")
+        validation_type = str(plan.parameters.get("validation_type", "list")).lower()
+        if validation_type == "list":
+            source = str(plan.parameters.get("source", "")).strip()
+            if not source:
+                raise HTTPException(status_code=400, detail="List validation requires a source.")
+            dv = DataValidation(type="list", formula1=source, allow_blank=True)
+        else:
+            operator = str(plan.parameters.get("operator", "between")).lower()
+            minimum = plan.parameters.get("minimum")
+            maximum = plan.parameters.get("maximum")
+            dv = DataValidation(type=validation_type, operator=operator, formula1=str(minimum), formula2=str(maximum))
+        worksheet.add_data_validation(dv)
+        dv.add(range_ref)
+
+    def _conditional_format_range(self, worksheet: Worksheet, plan: ActionPlan) -> None:
+        range_ref = str(plan.parameters.get("range", plan.impacted_range or "")).strip()
+        if not range_ref:
+            raise HTTPException(status_code=400, detail="Conditional formatting requires a range.")
+        color = str(plan.parameters.get("color", "C7F9CC")).replace("#", "")
+        operator = str(plan.parameters.get("operator", "greaterThan"))
+        threshold = plan.parameters.get("threshold")
+        if threshold is None:
+            raise HTTPException(status_code=400, detail="Conditional formatting requires a threshold.")
+        fill = PatternFill(start_color=color, end_color=color, fill_type="solid")
+        worksheet.conditional_formatting.add(
+            range_ref,
+            CellIsRule(operator=operator, formula=[str(threshold)], fill=fill),
+        )
+
     def _apply_filter(self, worksheet: Worksheet, plan: ActionPlan) -> None:
         target_column = self._resolve_column_letter(worksheet, plan.target_column)
         operator = str(plan.parameters.get("operator", "greater_than"))
@@ -734,6 +1495,8 @@ class WorkbookService:
             chart = LineChart()
         elif chart_type == "pie":
             chart = PieChart()
+        elif chart_type == "scatter":
+            chart = ScatterChart()
         else:
             chart = BarChart()
 
@@ -741,20 +1504,36 @@ class WorkbookService:
         chart.y_axis.title = str(plan.parameters.get("y_title", plan.target_column or value_column))
         chart.x_axis.title = str(plan.parameters.get("x_title", category_column))
 
-        data = Reference(
-            worksheet,
-            min_col=column_index_from_string(value_column),
-            min_row=self._detect_header_row(worksheet),
-            max_row=max(2, worksheet.max_row),
-        )
-        categories = Reference(
-            worksheet,
-            min_col=column_index_from_string(category_column),
-            min_row=self._data_start_row(worksheet),
-            max_row=max(2, worksheet.max_row),
-        )
-        chart.add_data(data, titles_from_data=True)
-        chart.set_categories(categories)
+        if chart_type == "scatter":
+            xvalues = Reference(
+                worksheet,
+                min_col=column_index_from_string(category_column),
+                min_row=self._data_start_row(worksheet),
+                max_row=max(2, worksheet.max_row),
+            )
+            yvalues = Reference(
+                worksheet,
+                min_col=column_index_from_string(value_column),
+                min_row=self._data_start_row(worksheet),
+                max_row=max(2, worksheet.max_row),
+            )
+            series = Series(yvalues, xvalues, title_from_data=True)
+            chart.series.append(series)
+        else:
+            data = Reference(
+                worksheet,
+                min_col=column_index_from_string(value_column),
+                min_row=self._detect_header_row(worksheet),
+                max_row=max(2, worksheet.max_row),
+            )
+            categories = Reference(
+                worksheet,
+                min_col=column_index_from_string(category_column),
+                min_row=self._data_start_row(worksheet),
+                max_row=max(2, worksheet.max_row),
+            )
+            chart.add_data(data, titles_from_data=True)
+            chart.set_categories(categories)
         chart.height = 8
         chart.width = 16
         chart_sheet.add_chart(chart, target_cell)
@@ -901,6 +1680,95 @@ class WorkbookService:
             ),
         )
         del session.command_history[30:]
+
+    def remember_plan(self, session_id: str, user_command: str, plan: ActionPlan) -> None:
+        session = self.get_session(session_id)
+        self._remember_plan(session, user_command, plan)
+
+    def _remember_plan(self, session: WorkbookSession, user_command: str, plan: ActionPlan) -> None:
+        session.last_command = user_command
+        session.last_plan = plan
+        self._push_recent_plan(session, plan)
+
+    def _push_recent_plan(self, session: WorkbookSession, plan: ActionPlan) -> None:
+        signature = self._plan_signature(plan)
+        session.recent_plans = [existing for existing in session.recent_plans if self._plan_signature(existing) != signature]
+        session.recent_plans.insert(0, plan)
+        del session.recent_plans[6:]
+
+    def _plan_signature(self, plan: ActionPlan) -> tuple[str, str, str | None, str | None, str | None]:
+        return (
+            plan.action,
+            plan.target_sheet,
+            plan.target_cell,
+            plan.target_column,
+            plan.formula,
+            json.dumps(plan.parameters, sort_keys=True, default=str),
+        )
+
+    def _plan_to_step(self, plan: ActionPlan) -> TaskStep:
+        return TaskStep(
+            title=plan.preview_title,
+            action=plan.action,
+            target_sheet=plan.target_sheet,
+            explanation=plan.explanation,
+            risk_level=plan.risk_level,
+            requires_confirmation=plan.requires_confirmation,
+            target_cell=plan.target_cell,
+            target_column=plan.target_column,
+            formula=plan.formula,
+            parameters=plan.parameters,
+        )
+
+    def _flatten_recent_steps(self, plans: list[ActionPlan]) -> list[TaskStep]:
+        steps: list[TaskStep] = []
+        for plan in plans:
+            if plan.action == "batch":
+                for step in self._batch_steps(plan):
+                    steps.append(self._plan_to_step(step))
+            else:
+                steps.append(self._plan_to_step(plan))
+        return steps[:6]
+
+    def _build_follow_up_prompts(self, session: WorkbookSession, memory_steps: list[TaskStep]) -> list[str]:
+        prompts: list[str] = []
+        if not session.last_plan:
+            return prompts
+
+        last_plan = session.last_plan
+        same_sheet_prompt = f"Do the same on {session.active_sheet}"
+        if last_plan.target_sheet != session.active_sheet:
+            same_sheet_prompt = f"Do the same for {session.active_sheet}"
+        prompts.append(same_sheet_prompt)
+
+        if last_plan.action in {"freeze_header", "auto_fit_columns", "create_table", "format_header"}:
+            prompts.append("Apply the same formatting to the next sheet")
+        elif last_plan.action in {"sort", "delete_duplicates", "apply_filter", "convert_column_type"} and last_plan.target_column:
+            prompts.append(f"Repeat this for {last_plan.target_column} on another sheet")
+        elif last_plan.action in {"insert_formula", "fill_formula_down", "generate_formula"}:
+            prompts.append("Generate the same formula for another sheet")
+
+        if memory_steps:
+            prompts.append("Run the same task as a multi-step batch")
+
+        return prompts[:4]
+
+    def _build_memory(self, session: WorkbookSession) -> ConversationMemory:
+        recent_history = session.command_history[:5]
+        recent_steps = self._flatten_recent_steps(session.recent_plans)
+        last_plan = session.last_plan
+        return ConversationMemory(
+            last_command=session.last_command or (recent_history[0].user_command if recent_history else None),
+            last_action=last_plan.action if last_plan else (recent_history[0].action if recent_history else None),
+            last_target_sheet=last_plan.target_sheet if last_plan else (recent_history[0].target_sheet if recent_history else session.active_sheet),
+            last_target_column=last_plan.target_column if last_plan else None,
+            last_formula=last_plan.formula if last_plan else None,
+            last_preview_title=last_plan.preview_title if last_plan else None,
+            recent_commands=[record.user_command for record in recent_history],
+            recent_actions=[f"{record.action} on {record.target_sheet}" for record in recent_history],
+            recent_steps=recent_steps,
+            follow_up_prompts=self._build_follow_up_prompts(session, recent_steps),
+        )
 
     def _serialize_workbook(self, workbook: Workbook) -> bytes:
         stream = BytesIO()

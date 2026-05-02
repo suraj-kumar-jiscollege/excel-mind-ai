@@ -8,6 +8,31 @@ from pydantic import BaseModel, Field
 ActionType = Literal[
     "insert_formula",
     "fill_formula_down",
+    "explain_formula",
+    "fix_formula",
+    "generate_formula",
+    "batch",
+    "create_table",
+    "freeze_header",
+    "auto_fit_columns",
+    "format_header",
+    "format_number",
+    "insert_rows",
+    "delete_rows",
+    "insert_columns",
+    "delete_columns",
+    "clear_cells",
+    "merge_cells",
+    "unmerge_cells",
+    "rename_sheet",
+    "hide_rows",
+    "unhide_rows",
+    "hide_columns",
+    "unhide_columns",
+    "add_comment",
+    "add_hyperlink",
+    "add_validation",
+    "conditional_format_range",
     "sort",
     "delete_duplicates",
     "find_replace",
@@ -17,6 +42,8 @@ ActionType = Literal[
     "create_chart",
     "convert_column_type",
     "create_pivot",
+    "analyze_workbook",
+    "recommend_chart",
     "add_sheet",
     "join_sheets",
     "noop",
@@ -37,6 +64,58 @@ class CommandTemplate(BaseModel):
     prompt: str
     description: str
     category: str
+
+
+class TaskStep(BaseModel):
+    title: str
+    action: str
+    target_sheet: str
+    explanation: str
+    risk_level: RiskLevel = "low"
+    requires_confirmation: bool = False
+    target_cell: str | None = None
+    target_column: str | None = None
+    formula: str | None = None
+    parameters: dict[str, Any] = Field(default_factory=dict)
+
+
+class ConversationMemory(BaseModel):
+    last_command: str | None = None
+    last_action: str | None = None
+    last_target_sheet: str | None = None
+    last_target_column: str | None = None
+    last_formula: str | None = None
+    last_preview_title: str | None = None
+    recent_commands: list[str] = Field(default_factory=list)
+    recent_actions: list[str] = Field(default_factory=list)
+    recent_steps: list[TaskStep] = Field(default_factory=list)
+    follow_up_prompts: list[str] = Field(default_factory=list)
+
+
+class WorkbookInsight(BaseModel):
+    title: str
+    detail: str
+    severity: Literal["info", "warning", "critical"] = "info"
+    sheet_name: str | None = None
+
+
+class ChartRecommendation(BaseModel):
+    title: str
+    detail: str
+    sheet_name: str
+    chart_type: str
+    category_column: str | None = None
+    value_column: str | None = None
+    confidence: Literal["low", "medium", "high"] = "medium"
+
+
+class WorkbookAnomaly(BaseModel):
+    title: str
+    detail: str
+    sheet_name: str
+    column: str | None = None
+    count: int = 0
+    sample: list[str] = Field(default_factory=list)
 
 
 class CommandRecord(BaseModel):
@@ -99,6 +178,10 @@ class WorkbookSnapshot(BaseModel):
     history: list[CommandRecord]
     templates: list[CommandTemplate]
     suggested_prompts: list[str]
+    memory: ConversationMemory
+    insights: list[WorkbookInsight]
+    chart_recommendations: list[ChartRecommendation]
+    anomalies: list[WorkbookAnomaly]
 
 
 class WorkbookOpenRequest(BaseModel):
@@ -144,6 +227,8 @@ class ActionPlan(BaseModel):
 class CommandPreviewRequest(BaseModel):
     session_id: str
     command: str = Field(min_length=2)
+    selected_cell: str | None = None
+    selected_value: Any = None
 
 
 class CommandPreviewResponse(BaseModel):
