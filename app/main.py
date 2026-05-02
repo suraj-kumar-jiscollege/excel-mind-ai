@@ -99,7 +99,7 @@ def redo_workbook(payload: WorkbookSessionRequest) -> WorkbookSnapshot:
 @app.post("/api/commands/preview", response_model=CommandPreviewResponse)
 async def preview_command(payload: CommandPreviewRequest) -> CommandPreviewResponse:
     plan = await ai_service.preview_command(
-.``        payload.session_id,
+        payload.session_id,
         payload.command,
         payload.selected_cell,
         payload.selected_value,
