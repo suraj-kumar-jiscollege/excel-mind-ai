@@ -24,50 +24,52 @@ class AIService:
         snapshot = workbook_service.get_snapshot(session_id)
         command_lower = command.lower().strip()
 
-        # Quick path for Undo/Redo
+        # Undo/Redo are still faster via heuristics
         if command_lower in ["undo", "undo last action", "revert"]:
-            return ActionPlan(
-                action="undo",
-                target_sheet=snapshot.active_sheet,
-                preview_title="Undo last action",
-                explanation="Revert the workbook to its previous state.",
-                risk_level="low",
-                requires_confirmation=False,
-                parameters={},
-                impact=ActionImpact(summary="The last change will be undone.", estimated_rows=0, estimated_cells=0)
-            )
+            return self._undo_plan(snapshot)
         if command_lower in ["redo", "redo action", "repeat"]:
-            return ActionPlan(
-                action="redo",
-                target_sheet=snapshot.active_sheet,
-                preview_title="Redo action",
-                explanation="Re-apply the change that was just undone.",
-                risk_level="low",
-                requires_confirmation=False,
-                parameters={},
-                impact=ActionImpact(summary="The undone change will be re-applied.", estimated_rows=0, estimated_cells=0)
-            )
+            return self._redo_plan(snapshot)
 
-        heuristic_plan = self._preview_with_heuristics(command, snapshot, selected_cell, selected_value)
-        result_plan = heuristic_plan
+        # 1. Try Gemini first for everything else
         if settings.gemini_api_key:
             try:
                 gemini_plan = await self._preview_with_gemini(command, snapshot, selected_cell, selected_value)
-                if gemini_plan.action == "noop" and heuristic_plan.action != "noop":
-                    result_plan = heuristic_plan
-                else:
-                    result_plan = gemini_plan
+                if gemini_plan.action != "noop":
+                    workbook_service.remember_plan(session_id, command, gemini_plan)
+                    return gemini_plan
             except Exception as e:
                 import sys
-                import traceback
                 print(f"Gemini API Error: {repr(e)}", file=sys.stderr)
-                traceback.print_exc(file=sys.stderr)
-                if heuristic_plan.action == "noop":
-                    heuristic_plan.explanation = f"API Error: {repr(e)}. Original heuristic message: {heuristic_plan.explanation}"
-                result_plan = heuristic_plan
-        if result_plan.action != "noop":
-            workbook_service.remember_plan(session_id, command, result_plan)
-        return result_plan
+
+        # 2. Fallback to heuristics if Gemini fails or returns noop
+        heuristic_plan = self._preview_with_heuristics(command, snapshot, selected_cell, selected_value)
+        if heuristic_plan.action != "noop":
+            workbook_service.remember_plan(session_id, command, heuristic_plan)
+        return heuristic_plan
+
+    def _undo_plan(self, snapshot: WorkbookSnapshot) -> ActionPlan:
+        return ActionPlan(
+            action="undo",
+            target_sheet=snapshot.active_sheet,
+            preview_title="Undo last action",
+            explanation="Revert the workbook to its previous state.",
+            risk_level="low",
+            requires_confirmation=False,
+            parameters={},
+            impact=ActionImpact(summary="The last change will be undone.", estimated_rows=0, estimated_cells=0)
+        )
+
+    def _redo_plan(self, snapshot: WorkbookSnapshot) -> ActionPlan:
+        return ActionPlan(
+            action="redo",
+            target_sheet=snapshot.active_sheet,
+            preview_title="Redo action",
+            explanation="Re-apply the change that was just undone.",
+            risk_level="low",
+            requires_confirmation=False,
+            parameters={},
+            impact=ActionImpact(summary="The undone change will be re-applied.", estimated_rows=0, estimated_cells=0)
+        )
 
     async def _preview_with_gemini(
         self,
@@ -112,6 +114,21 @@ class AIService:
         allow_batch: bool = True,
     ) -> ActionPlan:
         command_lower = command.lower().strip()
+        
+        # Bypass heuristics for verbal questions/analysis
+        verbal_tokens = ["batao", "kitna", "hai", "what is", "analyze", "analysis", "why", "how", "tell me", "summary"]
+        if any(token in command_lower for token in verbal_tokens):
+            return ActionPlan(
+                action="noop",
+                target_sheet=snapshot.active_sheet,
+                preview_title="Analysis mode",
+                explanation="Thinking...",
+                risk_level="low",
+                requires_confirmation=False,
+                parameters={},
+                impact=ActionImpact(summary="AI is analyzing your question.", estimated_rows=0, estimated_cells=0)
+            )
+
         target_sheet = self._find_target_sheet(command_lower, snapshot)
         sheet = self._sheet_by_name(snapshot, target_sheet)
         selected_header = self._selected_header_for_cell(sheet, selected_cell)
