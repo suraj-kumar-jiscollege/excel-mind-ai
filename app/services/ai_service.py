@@ -114,21 +114,6 @@ class AIService:
         allow_batch: bool = True,
     ) -> ActionPlan:
         command_lower = command.lower().strip()
-        
-        # Bypass heuristics for verbal questions/analysis
-        verbal_tokens = ["batao", "kitna", "hai", "what is", "analyze", "analysis", "why", "how", "tell me", "summary"]
-        if any(token in command_lower for token in verbal_tokens):
-            return ActionPlan(
-                action="noop",
-                target_sheet=snapshot.active_sheet,
-                preview_title="Analysis mode",
-                explanation="Thinking...",
-                risk_level="low",
-                requires_confirmation=False,
-                parameters={},
-                impact=ActionImpact(summary="AI is analyzing your question.", estimated_rows=0, estimated_cells=0)
-            )
-
         target_sheet = self._find_target_sheet(command_lower, snapshot)
         sheet = self._sheet_by_name(snapshot, target_sheet)
         selected_header = self._selected_header_for_cell(sheet, selected_cell)
