@@ -1727,30 +1727,28 @@ class AIService:
         )
         return (
             "You are ExcelMind AI, a world-class Excel automation agent. Your goal is to help users manipulate and analyze spreadsheets using natural language.\n\n"
+            "### CRITICAL INSTRUCTION ON INTENT:\n"
+            "1. ACTION vs QUESTION: Determine if the user wants to CHANGE the workbook (Action) or ASK about the data (Question).\n"
+            "   - If it's a QUESTION (e.g., 'Mera profit kitna hai?', 'Which month was best?', 'Analyze this'):\n"
+            "     - Set action to 'analyze_workbook'.\n"
+            "     - In the 'explanation' field, provide the DIRECT ANSWER based on the workbook data (e.g., 'Bhai, aapka total profit ₹5,000 hai...'). Use a friendly, professional tone (Hinglish/English as per user).\n"
+            "   - If it's an ACTION (e.g., 'Profit nikal do', 'Sum column B', 'Filter rows'):\n"
+            "     - Choose the appropriate action (insert_formula, apply_filter, etc.).\n"
+            "     - Use 'explanation' to describe what change you will apply.\n\n"
             "### INSTRUCTIONS:\n"
             "1. Analyze the 'Workbook context' (sheets, headers, data types, and samples) to understand the data structure.\n"
             "2. Use 'Conversation memory' to handle follow-up questions like 'do the same for the next sheet' or 'fix that'.\n"
-            "3. THINK STEP-BY-STEP. If the command requires multiple steps (e.g., 'filter sales > 500 then sort by date'), use the 'batch' action.\n"
+            "3. THINK STEP-BY-STEP. If the command requires multiple steps, use the 'batch' action.\n"
             "4. Be precise with range coordinates (e.g., A1, B2:C10).\n"
             "5. Respond ONLY with a valid JSON object matching the schema below.\n\n"
             "### ALLOWED ACTIONS:\n"
-            "- insert_formula: Create a single formula.\n"
-            "- fill_formula_down: Fill a formula across a column (use {row} as a placeholder).\n"
-            "- explain_formula: Breakdown a complex formula.\n"
-            "- fix_formula: Correct syntax errors or logical bugs in a formula.\n"
-            "- batch: Execute a sequence of multiple actions.\n"
-            "- analyze_workbook: Provide deep insights, trends, or anomaly reports.\n"
-            "- create_chart: Generate bar, line, pie, or scatter charts.\n"
-            "- sort, apply_filter, clear_filter: Manage data views.\n"
-            "- undo, redo: Revert or re-apply the last workbook changes.\n"
-            "- delete_duplicates, find_replace, convert_column_type: Clean data.\n"
-            "- add_sheet, join_sheets, rename_sheet: Manage workbook structure.\n\n"
+            "- insert_formula, fill_formula_down, explain_formula, fix_formula, batch, analyze_workbook, create_chart, sort, apply_filter, clear_filter, undo, redo, delete_duplicates, find_replace, convert_column_type, add_sheet, join_sheets, rename_sheet.\n\n"
             "### RESPONSE SCHEMA (JSON):\n"
             "{\n"
             "  \"action\": \"string\",\n"
             "  \"target_sheet\": \"string\",\n"
             "  \"preview_title\": \"string (clear & concise)\",\n"
-            "  \"explanation\": \"string (what you will do and why)\",\n"
+            "  \"explanation\": \"string (detailed answer for questions OR change description for actions)\",\n"
             "  \"risk_level\": \"low | medium | high\",\n"
             "  \"requires_confirmation\": boolean,\n"
             "  \"parameters\": { ... },\n"
@@ -1780,11 +1778,25 @@ class AIService:
 
     def _find_header_in_command(self, command: str, headers: list[str]) -> str | None:
         normalized_command = self._normalize(command)
+        # Try exact matches first
         for header in headers:
             normalized_header = self._normalize(header)
             if normalized_header and normalized_header in normalized_command:
                 return header
-        return headers[0] if headers else None
+        
+        # Try synonym matches if no direct match
+        synonyms = {
+            "income": ["collection", "received", "tuition", "fee", "revenue", "sales", "earning", "profit"],
+            "expense": ["spent", "payment", "cost", "outflow", "debit", "salary", "spend"],
+            "date": ["time", "month", "year", "day", "period"],
+        }
+        for category, tokens in synonyms.items():
+            if category in normalized_command or any(t in normalized_command for t in tokens):
+                for header in headers:
+                    norm_h = self._normalize(header)
+                    if any(t in norm_h for t in tokens) or norm_h == category:
+                        return header
+        return None
 
     def _selected_header_for_cell(self, sheet: dict[str, Any], selected_cell: str | None) -> str | None:
         if not selected_cell:
@@ -2423,6 +2435,16 @@ class AIService:
         numeric_headers = list(sheet.get("numeric_headers") or [])
         if preferred in numeric_headers:
             return preferred
+        
+        # Filter out obvious ID/Index/Serial columns if others exist
+        index_keywords = ["id", "serial", "s.no", "no.", "index", "row", "sl no", "a"]
+        better_numeric = [
+            h for h in numeric_headers 
+            if not any(k == h.lower() or k == self._normalize(h) for k in index_keywords)
+        ]
+        
+        if better_numeric:
+            return better_numeric[0]
         return numeric_headers[0] if numeric_headers else None
 
     def _pick_text_header(self, sheet: dict[str, Any], preferred: str | None) -> str | None:
