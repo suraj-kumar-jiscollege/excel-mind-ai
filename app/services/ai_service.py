@@ -416,11 +416,6 @@ class AIService:
                 ),
             )
 
-        if any(token in command_lower for token in ["profit", "net profit", "difference", "minus", "subtract", "revenue minus", "income minus", "collection minus"]):
-            difference_plan = self._build_difference_plan(command_lower, snapshot, target_sheet, sheet, matched_headers)
-            if difference_plan is not None:
-                return difference_plan
-
         if (
             any(token in command_lower for token in ["sumif", "averageif", "avgif", "countif"])
             or any(token in command_lower for token in [" where ", " jahan ", " when ", " contains ", " includes "])
