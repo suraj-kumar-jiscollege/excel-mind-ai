@@ -37,12 +37,24 @@ class AIService:
                 if gemini_plan.action != "noop":
                     workbook_service.remember_plan(session_id, command, gemini_plan)
                     return gemini_plan
+                else:
+                    # Debug: Gemini returned noop
+                    print(f"DEBUG: Gemini returned NOOP for command: {command}", file=sys.stderr)
             except Exception as e:
-                import sys
                 print(f"Gemini API Error: {repr(e)}", file=sys.stderr)
+        else:
+            print("DEBUG: GEMINI_API_KEY is NOT SET in environment", file=sys.stderr)
 
-        # 2. Fallback to heuristics if Gemini fails or returns noop
+        # 2. Fallback to heuristics
         heuristic_plan = self._preview_with_heuristics(command, snapshot, selected_cell, selected_value)
+        
+        # If both fail, give a more helpful 'Autonomous' error
+        if heuristic_plan.action == "noop":
+            if not settings.gemini_api_key:
+                heuristic_plan.explanation = "Bhai, Gemini AI Key set nahi hai backend me. Please env variables check karein."
+            else:
+                heuristic_plan.explanation = "Bhai, Gemini ne is baar koi solid plan nahi diya. Thoda aur detail me puchiye?"
+        
         if heuristic_plan.action != "noop":
             workbook_service.remember_plan(session_id, command, heuristic_plan)
         return heuristic_plan
