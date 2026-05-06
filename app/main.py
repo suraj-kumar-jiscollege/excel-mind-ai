@@ -24,18 +24,26 @@ from app.services.workbook_service import workbook_service
 
 app = FastAPI(title="ExcelMind AI Backend", version="0.1.0")
 
-origins = settings.cors_origins
-if "https://excelmind-ai.vercel.app" not in origins:
-    origins.append("https://excelmind-ai.vercel.app")
-
-allow_credentials = "*" not in origins
+# Simplified CORS for troubleshooting
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=allow_credentials,
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request, exc):
+    import sys
+    import traceback
+    print(f"GLOBAL ERROR: {repr(exc)}", file=sys.stderr)
+    traceback.print_exc(file=sys.stderr)
+    return Response(
+        content=f"Internal Server Error: {repr(exc)}",
+        status_code=500,
+        headers={"Access-Control-Allow-Origin": "*"}
+    )
 
 
 @app.get("/")
