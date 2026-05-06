@@ -107,15 +107,21 @@ class AIService:
         if not candidates:
             raise HTTPException(status_code=502, detail="Gemini returned no candidates.")
         text = candidates[0]["content"]["parts"][0].get("text", "")
-        text = text.strip()
-        if text.startswith("```json"):
-            text = text[7:]
-        if text.startswith("```"):
-            text = text[3:]
-        if text.endswith("```"):
-            text = text[:-3]
-        text = text.strip()
-        return ActionPlan.model_validate(json.loads(text))
+        
+        # Robust JSON extraction
+        try:
+            start = text.find('{')
+            end = text.rfind('}')
+            if start != -1 and end != -1:
+                json_str = text[start:end+1]
+                return ActionPlan.model_validate_json(json_str)
+            else:
+                # Try raw text as last resort
+                return ActionPlan.model_validate_json(text)
+        except Exception as e:
+            import sys
+            print(f"Pydantic Validation Error: {repr(e)}\nRaw Text: {text}", file=sys.stderr)
+            raise HTTPException(status_code=500, detail=f"AI Agent failed to format response: {repr(e)}")
 
     def _preview_with_heuristics(
         self,
