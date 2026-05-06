@@ -24,10 +24,14 @@ from app.services.workbook_service import workbook_service
 
 app = FastAPI(title="ExcelMind AI Backend", version="0.1.0")
 
-allow_credentials = "*" not in settings.cors_origins
+origins = settings.cors_origins
+if "https://excelmind-ai.vercel.app" not in origins:
+    origins.append("https://excelmind-ai.vercel.app")
+
+allow_credentials = "*" not in origins
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.cors_origins,
+    allow_origins=origins,
     allow_credentials=allow_credentials,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -95,7 +99,7 @@ def undo_workbook(payload: WorkbookSessionRequest) -> WorkbookSnapshot:
 def redo_workbook(payload: WorkbookSessionRequest) -> WorkbookSnapshot:
     return workbook_service.redo(payload.session_id)
 
-
+    
 @app.post("/api/commands/preview", response_model=CommandPreviewResponse)
 async def preview_command(payload: CommandPreviewRequest) -> CommandPreviewResponse:
     plan = await ai_service.preview_command(
