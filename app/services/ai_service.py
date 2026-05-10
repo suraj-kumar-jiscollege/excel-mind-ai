@@ -1736,45 +1736,45 @@ class AIService:
         selected_cell: str | None = None,
         selected_value: Any = None,
     ) -> str:
+        # Create a lean version of the workbook context for the AI
+        active_sheet = snapshot.active_sheet
+        sheets_info = []
+        for s in snapshot.sheets:
+            sheet_data = {
+                "name": s.name,
+                "headers": s.headers,
+                "max_row": s.max_row,
+                "max_col": s.max_column,
+            }
+            if s.name == active_sheet:
+                # Add sample rows only for the active sheet to save tokens
+                sheet_data["sample_rows"] = s.rows[:6] # Header + 5 rows
+            sheets_info.append(sheet_data)
+
         selection_context = (
             "No current cell selection."
             if not selected_cell
-            else f"Selected cell: {selected_cell}. Selected value: {json.dumps(selected_value, default=str)}."
+            else f"Selected cell: {selected_cell}. Value: {json.dumps(selected_value, default=str)}."
         )
+
         return (
-            "You are the ExcelMind Autonomous AI Agent. You don't just answer questions; you execute complex workflows.\n\n"
-            "### AGENT CAPABILITIES:\n"
-            "1. REASONING: Analyze headers and sample data to understand the semantic meaning of columns (e.g., 'Dues' means income).\n"
-            "2. MULTI-STEP PLANNING: If a user gives a complex task, break it into a 'batch' of actions. For example, 'Clean and Chart' = [delete_duplicates, format_number, create_chart].\n"
-            "3. AUTONOMY: Proactively suggest data improvements (anomalies, formatting) when asked to 'analyze' or 'fix everything'.\n"
-            "4. MEMORY: Refer to previous actions in 'Conversation memory' to handle follow-up intent correctly.\n\n"
-            "### MANUS-STYLE AGENT PROTOCOL:\n"
-            "In your 'explanation' field, ALWAYS follow this 3-step 'Thinking' format in Hinglish:\n"
-            "1. 🤔 THOUGHT: Describe your internal reasoning (e.g., 'Bhai, main income aur expense columns dhoond raha hoon...').\n"
-            "2. ⚙️ ACTION: Describe what you are calculating or what change you are planning.\n"
-            "3. ✅ RESULT: Provide the final answer or a summary of the change.\n\n"
-            "### CRITICAL INSTRUCTION ON INTENT:\n"
-            "1. ACTION vs QUESTION:\n"
-            "   - If the user asks a QUESTION (e.g., 'Batao', 'Kitna hai'): Set action to 'analyze_workbook'. Use the protocol above to report the answer.\n"
-            "   - If the user wants an ACTION (e.g., 'Fix', 'Insert'): Use 'batch' for complex tasks or the specific action needed.\n\n"
-            "2. PROFIT CALCULATION:\n"
-            "   - If asked for profit, look for columns like 'Income', 'Sales', 'Revenue', 'Received' and subtract 'Expense', 'Cost', 'Paid', 'Dues'. If you find them, calculate the sum and report it.\n\n"
-            "### RESPONSE SCHEMA (JSON):\n"
-            "{\n"
-            "  \"action\": \"string\",\n"
-            "  \"target_sheet\": \"string\",\n"
-            "  \"preview_title\": \"string (clear & concise)\",\n"
-            "  \"explanation\": \"string (Agent's reasoning and verbal results)\",\n"
-            "  \"risk_level\": \"low | medium | high\",\n"
-            "  \"requires_confirmation\": boolean,\n"
-            "  \"parameters\": { ... },\n"
-            "  \"impact\": { \"summary\": \"string\", \"estimated_rows\": number, \"estimated_cells\": number, \"warnings\": [] }\n"
-            "}\n\n"
+            "You are the ExcelMind Power-Agent (Manus-AI inspired).\n\n"
+            "### MANUS-STYLE PROTOCOL:\n"
+            "In 'explanation', use this Hinglish format:\n"
+            "1. 🤔 THOUGHT: Your reasoning about the data and headers.\n"
+            "2. ⚙️ ACTION: What you found or what you will calculate.\n"
+            "3. ✅ RESULT: Final answer or change summary.\n\n"
+            "### AGENT INSTRUCTIONS:\n"
+            "1. If asked a QUESTION ('Batao', 'Explain', 'Analysis'): Use action 'analyze_workbook'. Calculate the answer using the sample data/headers and report it in 'explanation'.\n"
+            "2. If asked to MODIFY ('Fix', 'Insert', 'Apply'): Choose the correct action or 'batch'.\n"
+            "3. SEMANTIC SEARCH: 'Profit' = 'Revenue/Income' minus 'Cost/Expense'. Map these to available headers intelligently.\n\n"
             "### CONTEXT:\n"
+            f"Active Sheet: {active_sheet}\n"
             f"Selection: {selection_context}\n"
-            f"Memory: {json.dumps(snapshot.memory.model_dump(), default=str)}\n"
-            f"Workbook: {json.dumps(snapshot.model_dump(), default=str)}\n\n"
+            f"Workbook Structure: {json.dumps(sheets_info, default=str)}\n"
+            f"Memory: {json.dumps(snapshot.memory.model_dump(), default=str)}\n\n"
             f"USER COMMAND: {command}\n"
+            "Respond ONLY with valid JSON."
         )
 
     def _sheet_by_name(self, snapshot: WorkbookSnapshot, sheet_name: str) -> dict[str, Any]:
