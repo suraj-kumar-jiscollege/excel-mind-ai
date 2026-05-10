@@ -1747,8 +1747,8 @@ class AIService:
                 "max_col": s.max_column,
             }
             if s.name == active_sheet:
-                # Add sample rows only for the active sheet to save tokens
-                sheet_data["sample_rows"] = s.rows[:6] # Header + 5 rows
+                # Add more sample rows for better context
+                sheet_data["sample_rows"] = s.rows[:11] # Header + 10 rows
             sheets_info.append(sheet_data)
 
         selection_context = (
@@ -1760,17 +1760,16 @@ class AIService:
         return (
             "You are the ExcelMind Power-Agent (Manus-AI inspired).\n\n"
             "### MANUS-STYLE PROTOCOL:\n"
-            "In 'explanation', use this Hinglish format:\n"
-            "1. 🤔 THOUGHT: Your reasoning about the data and headers.\n"
-            "2. ⚙️ ACTION: What you found or what you will calculate.\n"
-            "3. ✅ RESULT: Final answer or change summary.\n\n"
+            "In 'explanation', ALWAYS use this Hinglish format:\n"
+            "1. 🤔 THOUGHT: Your internal reasoning.\n"
+            "2. ⚙️ ACTION: What you found or calculated.\n"
+            "3. ✅ RESULT: Final answer or summary.\n\n"
             "### AGENT INSTRUCTIONS:\n"
-            "1. If asked a QUESTION ('Batao', 'Explain', 'Analysis'): Use action 'analyze_workbook'. Calculate the answer using the sample data/headers and report it in 'explanation'.\n"
-            "2. If asked to MODIFY ('Fix', 'Insert', 'Apply'): Choose the correct action or 'batch'.\n"
-            "3. SEMANTIC SEARCH: 'Profit' = 'Revenue/Income' minus 'Cost/Expense'. Map these to available headers intelligently.\n\n"
+            "1. QUESTION INTENT: If the user asks a question, YOU MUST use action 'analyze_workbook'. NEVER return 'noop' for a question.\n"
+            "2. IF UNSURE: If you cannot find the data, use 'analyze_workbook' and ask the user for clarification in your 'THOUGHT' section. DO NOT return an empty plan.\n"
+            "3. DATA MAPPING: Look at the headers carefully. Even if names are strange, try to guess the meaning (e.g. 'COVID cases' might be related to 'Impact').\n\n"
             "### CONTEXT:\n"
             f"Active Sheet: {active_sheet}\n"
-            f"Selection: {selection_context}\n"
             f"Workbook Structure: {json.dumps(sheets_info, default=str)}\n"
             f"Memory: {json.dumps(snapshot.memory.model_dump(), default=str)}\n\n"
             f"USER COMMAND: {command}\n"
