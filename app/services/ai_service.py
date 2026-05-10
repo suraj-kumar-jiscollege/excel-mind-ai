@@ -1770,7 +1770,7 @@ class AIService:
             "3. DATA MAPPING: Look at the headers carefully. Even if names are strange, try to guess the meaning (e.g. 'COVID cases' might be related to 'Impact').\n\n"
             "### RESPONSE SCHEMA (JSON):\n"
             "{\n"
-            "  \"action\": \"string\",\n"
+            "  \"action\": \"One of: analyze_workbook, batch, insert_formula, create_chart, create_pivot, format_number, apply_filter, sort, noop\",\n"
             "  \"target_sheet\": \"string\",\n"
             "  \"preview_title\": \"string (clear & concise)\",\n"
             "  \"explanation\": \"string (Agent's reasoning and verbal results)\",\n"
