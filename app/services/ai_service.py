@@ -49,12 +49,12 @@ class AIService:
         # 2. Fallback to heuristics
         heuristic_plan = self._preview_with_heuristics(command, snapshot, selected_cell, selected_value)
         
-        # If both fail, give a more helpful 'Autonomous' error
+        # If both fail, give a more helpful 'Autonomous' error (Version 2.0 check)
         if heuristic_plan.action == "noop":
             if not settings.gemini_api_key:
-                heuristic_plan.explanation = "Bhai, Gemini AI Key set nahi hai backend me. Please env variables check karein."
+                heuristic_plan.explanation = "[V2.0] Bhai, Gemini AI Key backend me missing hai. Please check karein."
             else:
-                heuristic_plan.explanation = "Bhai, Gemini ne is baar koi solid plan nahi diya. Thoda aur detail me puchiye?"
+                heuristic_plan.explanation = "[V2.0] Bhai, Gemini ne is baar koi solid plan nahi diya. Data thoda aur saaf karke puchiye?"
         
         if heuristic_plan.action != "noop":
             workbook_service.remember_plan(session_id, command, heuristic_plan)
