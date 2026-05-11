@@ -24,12 +24,22 @@ class AIService:
     ) -> ActionPlan:
         snapshot = workbook_service.get_snapshot(session_id)
         command_lower = command.lower().strip()
+        target_sheet = self._find_target_sheet(command_lower, snapshot)
 
         # Undo/Redo are still faster via heuristics
         if command_lower in ["undo", "undo last action", "revert"]:
             return self._undo_plan(snapshot)
         if command_lower in ["redo", "redo action", "repeat"]:
             return self._redo_plan(snapshot)
+
+        # Question-style prompts should resolve deterministically to workbook analysis.
+        # This prevents Gemini from returning noop for natural-language asks like
+        # "profit batao" or "show trends".
+        if self._is_analysis_intent(command_lower):
+            analysis_plan = self._preview_analysis_workflow(command_lower, snapshot, target_sheet)
+            if analysis_plan is not None:
+                workbook_service.remember_plan(session_id, command, analysis_plan)
+                return analysis_plan
 
         # 1. Try Gemini first for everything else
         if settings.gemini_api_key:
@@ -82,6 +92,74 @@ class AIService:
             requires_confirmation=False,
             parameters={},
             impact=ActionImpact(summary="The undone change will be re-applied.", estimated_rows=0, estimated_cells=0)
+        )
+
+    @staticmethod
+    def _is_analysis_intent(command_lower: str) -> bool:
+        if any(
+            token in command_lower
+            for token in [
+                "rename",
+                "insert",
+                "delete",
+                "remove",
+                "add ",
+                "merge",
+                "split",
+                "comment",
+                "note",
+                "hyperlink",
+                "link",
+                "validation",
+                "validate",
+                "filter",
+                "sort",
+                "chart",
+                "graph",
+                "formula",
+                "create table",
+                "freeze",
+                "format",
+                "clear",
+                "hide",
+                "unhide",
+                "duplicate",
+                "replace",
+            ]
+        ):
+            return False
+
+        return any(
+            token in command_lower
+            for token in [
+                "analyze",
+                "analysis",
+                "insight",
+                "insights",
+                "anomaly",
+                "anomalies",
+                "outlier",
+                "trend",
+                "overview",
+                "what is happening",
+                "what's happening",
+                "batao",
+                "dikhao",
+                "samjhao",
+                "kaise",
+                "how much",
+                "how many",
+                "how",
+                "what is",
+                "what's",
+                "tell me",
+                "profit",
+                "income",
+                "revenue",
+                "sales",
+                "total",
+                "summary",
+            ]
         )
 
     async def _preview_with_gemini(
@@ -1207,7 +1285,7 @@ class AIService:
         snapshot: WorkbookSnapshot,
         target_sheet: str,
     ) -> ActionPlan | None:
-        if not any(token in command_lower for token in ["analyze", "analysis", "insight", "insights", "anomaly", "anomalies", "outlier", "trend", "overview", "review", "what is happening", "what's happening"]):
+        if not self._is_analysis_intent(command_lower):
             return None
 
         insights = snapshot.insights[:3]
@@ -1761,19 +1839,20 @@ class AIService:
             "You are the ExcelMind Power-Agent (Manus-AI inspired).\n\n"
             "### MANUS-STYLE PROTOCOL:\n"
             "In 'explanation', ALWAYS use this Hinglish format:\n"
-            "1. 🤔 THOUGHT: Your internal reasoning.\n"
+            "1. 🤔 THOUGHT: Your internal reasoning. (Hindi/English mix)\n"
             "2. ⚙️ ACTION: What you found or calculated.\n"
-            "3. ✅ RESULT: Final answer or summary.\n\n"
+            "3. ✅ RESULT: Final answer or summary. (Directly answering the user)\n\n"
             "### AGENT INSTRUCTIONS:\n"
-            "1. QUESTION INTENT: If the user asks a question, YOU MUST use action 'analyze_workbook'. NEVER return 'noop' for a question.\n"
-            "2. IF UNSURE: If you cannot find the data, use 'analyze_workbook' and ask the user for clarification in your 'THOUGHT' section. DO NOT return an empty plan.\n"
-            "3. DATA MAPPING: Look at the headers carefully. Even if names are strange, try to guess the meaning (e.g. 'COVID cases' might be related to 'Impact').\n\n"
+            "1. QUESTION INTENT: If the user asks a question (e.g., 'what is total sales?', 'profit batao', 'show trends'), YOU MUST use action 'analyze_workbook'. NEVER return 'noop' for a question.\n"
+            "2. CALCULATION: If you need to perform a calculation to answer, DO IT in your 'THOUGHT' section and provide the result in 'RESULT'.\n"
+            "3. DATA MAPPING: Headers can be messy. 'COVID-19 (Feb)' might be a category. 'School not Sta...' might be a status. Map them intelligently.\n"
+            "4. RESPONSE SCHEMA: You MUST return a valid JSON object matching the structure below.\n\n"
             "### RESPONSE SCHEMA (JSON):\n"
             "{\n"
-            "  \"action\": \"One of: analyze_workbook, batch, insert_formula, create_chart, create_pivot, format_number, apply_filter, sort, noop\",\n"
+            "  \"action\": \"analyze_workbook | generate_formula | insert_formula | create_chart | create_pivot | format_number | apply_filter | sort | batch | noop\",\n"
             "  \"target_sheet\": \"string\",\n"
-            "  \"preview_title\": \"string (clear & concise)\",\n"
-            "  \"explanation\": \"string (Agent's reasoning and verbal results)\",\n"
+            "  \"preview_title\": \"string (e.g. 'Profit Analysis' or 'Insert Total')\",\n"
+            "  \"explanation\": \"string (The Hinglish THOUGHT/ACTION/RESULT blocks)\",\n"
             "  \"risk_level\": \"low | medium | high\",\n"
             "  \"requires_confirmation\": boolean,\n"
             "  \"parameters\": { ... },\n"

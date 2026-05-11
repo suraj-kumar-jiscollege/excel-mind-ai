@@ -72,6 +72,11 @@ class ConversationMemoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(plan.action, "analyze_workbook")
         self.assertIn("analysis", plan.preview_title.lower())
 
+    async def test_hinglish_analysis_prompt_routes_to_workbook_analysis(self) -> None:
+        plan = await ai_service.preview_command(self.session_id, "profit batao")
+        self.assertEqual(plan.action, "analyze_workbook")
+        self.assertIn("analysis", plan.preview_title.lower())
+
 
 if __name__ == "__main__":
     unittest.main()
